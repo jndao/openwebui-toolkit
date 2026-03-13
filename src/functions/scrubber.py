@@ -1,11 +1,13 @@
 """
 title: Scrubber (Filter)
-description: Performs "scrubbing" of chat outputs to ensure they are valid. Image scrubbing is currently supported.
-version: 0.0.1-alpha
+description: Performs "scrubbing" of chat outputs to ensure they are valid and safer.
+version: 0.1.1
 """
 
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any, Tuple
+import re
+
 
 # =============================================================================
 # CONSTANTS: Image Magic Bytes (Base64-encoded)
@@ -28,7 +30,6 @@ VALID_IMAGE_PREFIXES = tuple(
 # =============================================================================
 # VALIDATOR
 # =============================================================================
-
 
 def is_valid_image_url(url: str) -> bool:
     """Check if a URL contains valid image data."""
@@ -68,161 +69,25 @@ def extract_image_url(image_data: Any) -> Optional[str]:
 # BASE SCRUBBER
 # =============================================================================
 
-
 class Scrubber:
     """Base class for scrubbing invalid data from streams."""
 
     def should_scrub(self, data: Any) -> bool:
-        """
-        Check if this scrubber should process this data.
-        Override in subclass.
-        """
+        """Check if this scrubber should process this data."""
         return False
 
     def scrub(self, data: Any) -> Any:
-        """
-        Perform the scrubbing action.
-        Override in subclass.
-        """
+        """Perform the scrubbing action."""
         return data
+
+    def scrub_message(self, message: dict) -> dict:
+        """Scrub a message object (optional override)."""
+        return message
 
 
 # =============================================================================
 # IMAGE SCRUBBER
 # =============================================================================
-
-
-class PIIScrubber(Scrubber):
-    """Scrubs personally identifiable information from text content."""
-    
-    patterns = {
-        "email": r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
-        "phone": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
-        "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
-        "credit_card": r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b",
-        "api_key": r"(?i)(api[_-]?key|token|secret)[\s:=]+[a-zA-Z0-9_-]{20,}",
-    }
-
-    def should_scrub(self, data: Any) -> bool:
-        """
-        Check if data contains text that might need PII scrubbing.
-        """
-        if isinstance(data, dict):
-            # Check for text content in various formats
-            if "content" in data:
-                content = data["content"]
-                if isinstance(content, str) and content.strip():
-                    return True
-                if isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("text", "").strip():
-                            return True
-
-            # Check for choices with delta content
-            if "choices" in data:
-                for choice in data.get("choices", []):
-                    delta = choice.get("delta", {})
-                    if "content" in delta and delta["content"]:
-                        return True
-
-        return False
-
-    def scrub_text(self, text: str) -> str:
-        """Scrub PII patterns from text content."""
-        if not text or not isinstance(text, str):
-            return text
-
-        import re
-        scrubbed_text = text
-        
-        # Apply each pattern
-        for pii_type, pattern in self.patterns.items():
-            if pii_type == "api_key":
-                # For API keys, replace with [REDACTED_API_KEY]
-                scrubbed_text = re.sub(pattern, "[REDACTED_API_KEY]", scrubbed_text)
-            elif pii_type == "email":
-                # For emails, show first letter and domain
-                def anonymize_email(match):
-                    email = match.group(0)
-                    if "@" in email:
-                        local, domain = email.split("@", 1)
-                        if len(local) > 0:
-                            return f"{local[0]}***@{domain}"
-                    return "***@***"
-                scrubbed_text = re.sub(pattern, anonymize_email, scrubbed_text)
-            elif pii_type == "phone":
-                # For phone numbers, show last 4 digits only
-                def anonymize_phone(match):
-                    phone = match.group(0)
-                    # Keep only last 4 digits
-                    digits = ''.join(c for c in phone if c.isdigit())
-                    if len(digits) >= 4:
-                        return f"***-***-{digits[-4:]}"
-                    return "***-***-****"
-                scrubbed_text = re.sub(pattern, anonymize_phone, scrubbed_text)
-            elif pii_type == "ssn":
-                # For SSN, show only last 4 digits
-                def anonymize_ssn(match):
-                    ssn = match.group(0)
-                    digits = ''.join(c for c in ssn if c.isdigit())
-                    if len(digits) == 9:
-                        return f"***-**-{digits[-4:]}"
-                    return "***-**-****"
-                scrubbed_text = re.sub(pattern, anonymize_ssn, scrubbed_text)
-            elif pii_type == "credit_card":
-                # For credit cards, show only last 4 digits
-                def anonymize_cc(match):
-                    cc = match.group(0)
-                    digits = ''.join(c for c in cc if c.isdigit())
-                    if len(digits) >= 4:
-                        return f"****-****-****-{digits[-4:]}"
-                    return "****-****-****-****"
-                scrubbed_text = re.sub(pattern, anonymize_cc, scrubbed_text)
-
-        return scrubbed_text
-
-    def scrub(self, data: Any) -> Any:
-        """Scrub PII from the data object."""
-        if isinstance(data, dict):
-            result = data.copy()
-            
-            # Scrub content in choices
-            if "choices" in result:
-                for choice in result["choices"]:
-                    delta = choice.get("delta", {})
-                    if "content" in delta and delta["content"]:
-                        delta["content"] = self.scrub_text(delta["content"])
-            
-            # Scrub direct content
-            if "content" in result:
-                if isinstance(result["content"], str):
-                    result["content"] = self.scrub_text(result["content"])
-                elif isinstance(result["content"], list):
-                    for item in result["content"]:
-                        if isinstance(item, dict) and "text" in item:
-                            item["text"] = self.scrub_text(item["text"])
-            
-            return result
-        
-        return data
-
-    def scrub_message(self, message: dict) -> dict:
-        """Scrub PII from a message object."""
-        if "content" in message:
-            if isinstance(message["content"], str):
-                message["content"] = self.scrub_text(message["content"])
-            elif isinstance(message["content"], list):
-                for item in message["content"]:
-                    if isinstance(item, dict) and "text" in item:
-                        item["text"] = self.scrub_text(item["text"])
-        
-        # Also scrub other fields that might contain PII
-        for key in ["role", "name", "content"]:
-            if key in message and isinstance(message[key], str):
-                message[key] = self.scrub_text(message[key])
-        
-        return message
-
 
 class ImageScrubber(Scrubber):
     """Scrubs invalid/phantom images from stream events."""
@@ -302,15 +167,261 @@ class ImageScrubber(Scrubber):
 
 
 # =============================================================================
-# FILTER
+# PII SCRUBBER
 # =============================================================================
 
+class PIIScrubber(Scrubber):
+    """Scrubs personally identifiable information from text content."""
+    
+    patterns = {
+        "email": r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        "phone": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
+        "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
+        "credit_card": r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b",
+    }
+
+    def should_scrub(self, data: Any) -> bool:
+        """Check if data contains text that might need PII scrubbing."""
+        if isinstance(data, dict):
+            # Check for text content in various formats
+            if "content" in data:
+                content = data["content"]
+                if isinstance(content, str) and content.strip():
+                    # Quick regex check for potential PII patterns
+                    return bool(re.search(r'@|\d{3}[-.]?\d{3}', content))
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("text", "").strip():
+                            return bool(re.search(r'@|\d{3}[-.]?\d{3}', item.get("text", "")))
+
+            # Check for choices with delta content
+            if "choices" in data:
+                for choice in data.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        return bool(re.search(r'@|\d{3}[-.]?\d{3}', delta["content"]))
+
+        return False
+
+    def scrub_text(self, text: str) -> str:
+        """Scrub PII patterns from text content."""
+        if not text or not isinstance(text, str):
+            return text
+
+        scrubbed_text = text
+        
+        # Apply each pattern
+        for pii_type, pattern in self.patterns.items():
+            if pii_type == "email":
+                # For emails, show first letter and domain
+                def anonymize_email(match):
+                    email = match.group(0)
+                    if "@" in email:
+                        local, domain = email.split("@", 1)
+                        if len(local) > 0:
+                            return f"{local[0]}***@{domain}"
+                    return "***@***"
+                scrubbed_text = re.sub(pattern, anonymize_email, scrubbed_text)
+            elif pii_type == "phone":
+                # For phone numbers, show last 4 digits only
+                def anonymize_phone(match):
+                    phone = match.group(0)
+                    # Keep only last 4 digits
+                    digits = ''.join(c for c in phone if c.isdigit())
+                    if len(digits) >= 4:
+                        return f"***-***-{digits[-4:]}"
+                    return "***-***-****"
+                scrubbed_text = re.sub(pattern, anonymize_phone, scrubbed_text)
+            elif pii_type == "ssn":
+                # For SSN, show only last 4 digits
+                def anonymize_ssn(match):
+                    ssn = match.group(0)
+                    digits = ''.join(c for c in ssn if c.isdigit())
+                    if len(digits) == 9:
+                        return f"***-**-{digits[-4:]}"
+                    return "***-**-****"
+                scrubbed_text = re.sub(pattern, anonymize_ssn, scrubbed_text)
+            elif pii_type == "credit_card":
+                # For credit cards, show only last 4 digits
+                def anonymize_cc(match):
+                    cc = match.group(0)
+                    digits = ''.join(c for c in cc if c.isdigit())
+                    if len(digits) >= 4:
+                        return f"****-****-****-{digits[-4:]}"
+                    return "****-****-****-****"
+                scrubbed_text = re.sub(pattern, anonymize_cc, scrubbed_text)
+            else:
+                # Default: replace with [REDACTED]
+                scrubbed_text = re.sub(pattern, f"[REDACTED_{pii_type.upper()}]", scrubbed_text)
+
+        return scrubbed_text
+
+    def scrub(self, data: Any) -> Any:
+        """Scrub PII from the data object."""
+        if isinstance(data, dict):
+            result = data.copy()
+            
+            # Scrub content in choices
+            if "choices" in result:
+                for choice in result["choices"]:
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        delta["content"] = self.scrub_text(delta["content"])
+            
+            # Scrub direct content
+            if "content" in result:
+                if isinstance(result["content"], str):
+                    result["content"] = self.scrub_text(result["content"])
+                elif isinstance(result["content"], list):
+                    for item in result["content"]:
+                        if isinstance(item, dict) and "text" in item:
+                            item["text"] = self.scrub_text(item["text"])
+            
+            return result
+        
+        return data
+
+    def scrub_message(self, message: dict) -> dict:
+        """Scrub PII from a message object."""
+        if "content" in message:
+            if isinstance(message["content"], str):
+                message["content"] = self.scrub_text(message["content"])
+            elif isinstance(message["content"], list):
+                for item in message["content"]:
+                    if isinstance(item, dict) and "text" in item:
+                        item["text"] = self.scrub_text(item["text"])
+        
+        # Also scrub other fields that might contain PII
+        for key in ["role", "name", "content"]:
+            if key in message and isinstance(message[key], str):
+                message[key] = self.scrub_text(message[key])
+        
+        return message
+
+
+# =============================================================================
+# CREDENTIAL SCRUBBER
+# =============================================================================
+
+class CredentialScrubber(Scrubber):
+    """Scrubs various types of credentials and secrets from text content."""
+    
+    patterns = {
+        # API Keys and Tokens
+        "api_key": r"(?i)(api[_-]?key|token|secret|credential)[\s:=]+[a-zA-Z0-9_-]{20,}",
+        "openai_api_key": r"\bsk-[a-zA-Z0-9]{20,}\b",
+        "google_api_key": r"\bAIza[0-9A-Za-z-_]{30,}\b",
+        "stripe_key": r"\b(sk|pk)_(test|live)_[a-zA-Z0-9]{20,}\b",
+        
+        # Cloud Provider Credentials
+        "aws_access_key": r"\bAKIA[0-9A-Z]{16}\b",
+        "aws_secret_key": r"\b[a-zA-Z0-9/+=]{40}\b",
+        "gcp_service_account": r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b",
+        
+        # Platform Tokens
+        "github_token": r"\b(ghp_|gho_|ghu_|ghs_|github_pat_)[a-zA-Z0-9]{20,}\b",
+        "slack_token": r"\b(xox[baprs]-[a-zA-Z0-9]{10,})\b",
+        "discord_token": r"\b[a-zA-Z0-9_-]{24}\.[a-zA-Z0-9_-]{6}\.[a-zA-Z0-9_-]{27}\b",
+        
+        # Cryptographic
+        "private_key": r"\b-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA )?PRIVATE KEY-----\b",
+        "jwt_token": r"\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b",
+        
+        # Authentication Patterns
+        "authorization_header": r"\bBearer [a-zA-Z0-9-_=]+\b", 
+        "session_id": r"\b[A-Fa-f0-9]{32}\b",
+        "password_in_url": r"\b[a-zA-Z]+://[^/\s]+:[^@\s]+@[^/\s]+\b",
+    }
+
+    def should_scrub(self, data: Any) -> bool:
+        """Check if data contains text that might need credential scrubbing."""
+        if isinstance(data, dict):
+            # Check for text content in various formats
+            if "content" in data:
+                content = data["content"]
+                if isinstance(content, str) and content.strip():
+                    # Quick regex check for common credential patterns
+                    return bool(re.search(r'(api[_-]?key|token|secret|sk-|AKIA|Bearer|github_pat_)', content, re.IGNORECASE))
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("text", "").strip():
+                            text = item.get("text", "")
+                            return bool(re.search(r'(api[_-]?key|token|secret|sk-|AKIA|Bearer|github_pat_)', text, re.IGNORECASE))
+
+            # Check for choices with delta content
+            if "choices" in data:
+                for choice in data.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        return bool(re.search(r'(api[_-]?key|token|secret|sk-|AKIA|Bearer|github_pat_)', delta["content"], re.IGNORECASE))
+
+        return False
+
+    def scrub_text(self, text: str) -> str:
+        """Scrub credential patterns from text content."""
+        if not text or not isinstance(text, str):
+            return text
+
+        scrubbed_text = text
+        
+        # Apply each pattern - log but don't reveal in output
+        for cred_type, pattern in self.patterns.items():
+            # Replace credentials with generic marker
+            scrubbed_text = re.sub(pattern, f"[REDACTED_{cred_type.upper()}]", scrubbed_text)
+
+        return scrubbed_text
+
+    def scrub(self, data: Any) -> Any:
+        """Scrub credentials from the data object."""
+        if isinstance(data, dict):
+            result = data.copy()
+            
+            # Scrub content in choices
+            if "choices" in result:
+                for choice in result["choices"]:
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        delta["content"] = self.scrub_text(delta["content"])
+            
+            # Scrub direct content
+            if "content" in result:
+                if isinstance(result["content"], str):
+                    result["content"] = self.scrub_text(result["content"])
+                elif isinstance(result["content"], list):
+                    for item in result["content"]:
+                        if isinstance(item, dict) and "text" in item:
+                            item["text"] = self.scrub_text(item["text"])
+            
+            return result
+        
+        return data
+
+    def scrub_message(self, message: dict) -> dict:
+        """Scrub credentials from a message object."""
+        if "content" in message:
+            if isinstance(message["content"], str):
+                message["content"] = self.scrub_text(message["content"])
+            elif isinstance(message["content"], list):
+                for item in message["content"]:
+                    if isinstance(item, dict) and "text" in item:
+                        item["text"] = self.scrub_text(item["text"])
+        
+        # Also scrub other fields that might contain credentials
+        for key in ["role", "name", "content"]:
+            if key in message and isinstance(message[key], str):
+                message[key] = self.scrub_text(message[key])
+        
+        return message
+
+
+# =============================================================================
+# FILTER
+# =============================================================================
 
 class Filter:
     """
     OpenWebUI Filter that orchestrates scrubbing.
-    Determines which scrubber to use, checks if scrubbing is needed,
-    and invokes the scrub action.
+    Simplified to use all scrubbers in sequence without complex filtering.
     """
 
     class Valves(BaseModel):
@@ -318,23 +429,25 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+        # Simple list of all scrubbers to apply in sequence
         self.scrubbers = [
             ImageScrubber(),
             PIIScrubber(),
+            CredentialScrubber()
         ]
 
     def stream(self, event: dict) -> dict:
-        """Process stream event through all scrubbers."""
+        """Process stream event through all scrubbers in sequence."""
+        # Apply all scrubbers in sequence (early exit is handled by individual scrubbers)
         for scrubber in self.scrubbers:
-            if scrubber.should_scrub(event):
-                event = scrubber.scrub(event)
+            event = scrubber.scrub(event)
         return event
 
     def outlet(self, body: Dict, __user__: Dict) -> Dict:
-        """Process outlet messages through all scrubbers."""
+        """Process outlet messages through all scrubbers in sequence."""
         if "messages" in body:
             for msg in body["messages"]:
+                # Apply scrubbing to each message
                 for scrubber in self.scrubbers:
-                    if hasattr(scrubber, "scrub_message"):
-                        scrubber.scrub_message(msg)
+                    scrubber.scrub_message(msg)
         return body
