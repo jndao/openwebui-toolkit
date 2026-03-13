@@ -1,7 +1,7 @@
 """
-title: Scrubber (Filter)
-description: Performs "scrubbing" of chat outputs to ensure they are valid and safer.
-version: 0.1.2
+title: Scrubber
+description: Advanced content scrubbing to prevent rendering of potentially malicious content.
+version: 0.1.3
 """
 
 from pydantic import BaseModel
@@ -354,14 +354,17 @@ class CredentialScrubber(TextScrubber):
                     for item in content:
                         if isinstance(item, dict) and item.get("text", "").strip():
                             text = item.get("text", "")
-                            return bool(self.quick_check.search(text))
+                            if isinstance(text, str) and bool(self.quick_check.search(text)):
+                                return True
 
             # Check for choices with delta content
             if "choices" in data:
                 for choice in data.get("choices", []):
                     delta = choice.get("delta", {})
                     if "content" in delta and delta["content"]:
-                        return bool(self.quick_check.search(delta["content"]))
+                        content = delta["content"]
+                        if isinstance(content, str) and bool(self.quick_check.search(content)):
+                            return True
 
         return False
 
@@ -408,7 +411,7 @@ class Filter:
         """Process stream event through all scrubbers in sequence."""
         # Apply all scrubbers in sequence (early exit is handled by individual scrubbers)
         for scrubber in self.scrubbers:
-            if scrubber.should_scrub(event):  # <-- Add this check!
+            if scrubber.should_scrub(event):
                 event = scrubber.scrub(event)
         return event
 
