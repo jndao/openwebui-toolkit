@@ -425,11 +425,11 @@ class Filter:
         return body
 
     def inlet(self, body: dict) -> dict:
-        """Scrub user inputs before sending to LLM."""
         if "messages" in body:
             for msg in body["messages"]:
                 for scrubber in self.scrubbers:
-                    # Only run text-based scrubbers on input
                     if hasattr(scrubber, 'scrub_text'):
-                        scrubber.scrub_message(msg)
+                        # Optionally check should_scrub here too for performance
+                        if scrubber.should_scrub(msg):
+                            scrubber.scrub_message(msg)
         return body
