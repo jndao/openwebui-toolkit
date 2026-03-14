@@ -1,7 +1,7 @@
 """
 title: Live context injector
 description: Injects relevant live information to allow models to be more aware of the live context of a chat.
-version: 0.0.1
+version: 0.0.2
 """
 
 import logging
@@ -59,8 +59,16 @@ class Filter:
         current_timezone = variables.get('{{CURRENT_TIMEZONE}}', 'unknown')
         user_language = variables.get('{{USER_LANGUAGE}}', 'unknown')
         
+        # Fallback for user location: use timezone if user_location is unknown
+        location_fallback = False
+        if user_location in ('unknown', 'Unknown', ''):
+            if current_timezone and current_timezone != 'unknown':
+                user_location = current_timezone + "(Timezone Fallback)"
+                location_fallback = True
+        
         if self.valves.debug_mode:
-            logger.info(f"[Live Context Injector] Using variables - User: {user_name}, Timezone: {current_timezone}")
+            location_status = "fallback to timezone" if location_fallback else "from user profile"
+            logger.info(f"[Live Context Injector] Using variables - User: {user_name}, Location: {location_status}")
         
         # Build context template with variables from request
         context_template = f"""<live_context>
