@@ -1,9 +1,9 @@
 """
-title: Dynamic Image Compressor
-id: dynamic_image_compressor
+title: Dynamic Media Compressor
+id: dynamic_media_compressor
 author: jndao
 author_url: https://github.com/jndao
-description: Automatically compresses large images in messages to prevent 413 Request Entity Too Large errors. Works with base64-encoded images and supports configurable size thresholds.
+description: Automatically compresses large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports configurable size thresholds and quality gradients.
 version: 0.1.1
 license: MIT
 
@@ -11,19 +11,19 @@ license: MIT
 📌 Overview
 ═══════════════════════════════════════════════════════════════════════════════
 
-This filter automatically compresses images in chat messages when they exceed
+This filter automatically compresses media (primarily images) in chat messages when they exceed
 a configurable size threshold. This helps prevent "413 Request Entity Too Large"
-errors when sending messages with large images to LLM providers.
+errors when sending messages with large media to LLM providers.
 
 Core Features:
   ✅ Automatic detection of base64-encoded images in messages
   ✅ Configurable size threshold for triggering compression
-  ✅ Quality-preserving compression with adjustable quality settings
+  ✅ Quality gradient - recent images get higher quality, older images get more compression
   ✅ Support for multiple image formats (PNG, JPEG, GIF, WebP)
   ✅ Automatic format conversion for better compression (PNG → JPEG when appropriate)
-  ✅ Maximum dimension limits to reduce image size
   ✅ Detailed logging and status notifications
   ✅ Runs AFTER context compression to process final message list
+  ✅ Fallback strategy: drops images when compression isn't sufficient
 
 ═══════════════════════════════════════════════════════════════════════════════
 ⚙️ Configuration
