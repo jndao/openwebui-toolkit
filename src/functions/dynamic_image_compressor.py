@@ -4,7 +4,7 @@ id: dynamic_image_compressor
 author: jndao
 author_url: https://github.com/jndao
 description: Automatically compresses large images in messages to prevent 413 Request Entity Too Large errors. Works with base64-encoded images and supports configurable size thresholds.
-version: 0.1.0
+version: 0.1.1
 license: MIT
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -35,27 +35,32 @@ priority
   the final message list after context compression has assembled it.
 
 max_image_size_bytes
-  Default: 5242880 (5MB)
-  Description: Maximum allowed image size in bytes before compression is triggered.
-  Images larger than this will be compressed.
+  Default: 1048576 (1MB)
+  Description: Maximum image size in bytes. Images larger than this will be compressed.
 
-compression_quality
+max_payload_size_bytes
+  Default: 10485760 (10MB)
+  Description: Maximum total payload size. If exceeded, oldest images will be dropped.
+
+enable_quality_gradient
+  Default: true
+  Description: Enable quality gradient - recent images get higher quality, older images get more compression.
+
+recent_image_quality
   Default: 85
-  Description: JPEG/WebP compression quality (1-100). Higher values = better quality, larger files.
+  Description: Compression quality for the most recent images (0-100). Higher = better quality, larger files.
 
-max_image_dimension
-  Default: 2048
-  Description: Maximum width or height for images. Images larger than this will be resized.
+old_image_quality
+  Default: 40
+  Description: Compression quality for the oldest images (0-100). Lower = more compression, smaller files.
 
 convert_png_to_jpeg
   Default: true
-  Description: Convert PNG images to JPEG when they exceed the size threshold.
-  This can significantly reduce file size for photos and complex images.
+  Description: Convert PNG images to JPEG for better compression.
 
 preserve_transparency
   Default: true
-  Description: When converting PNG to WebP instead of JPEG to preserve transparency.
-  If false, PNGs will be converted to JPEG (which doesn't support transparency).
+  Description: When enabled, transparent PNGs will be converted to WebP instead of JPEG to preserve transparency.
 
 enable_status_notifications
   Default: true
@@ -72,15 +77,12 @@ debug_mode
 1. Inlet Phase (Before LLM Request):
    - Runs AFTER context compression (priority 15 > 10)
    - Scans all messages for base64-encoded images
-   - Checks each image against the size threshold
-   - Compresses oversized images using PIL/Pillow
-   - Resizes images if they exceed max dimension
-   - Converts format if beneficial (PNG → JPEG/WebP)
+   - Applies quality gradient (recent images = higher quality, older = lower)
+   - Compresses images using PIL/Pillow
 
-2. Compression Strategy:
-   - First attempt: Resize if dimensions exceed max_image_dimension
-   - Second attempt: Reduce quality progressively
-   - Final attempt: Convert to more efficient format
+2. Fallback Strategy:
+   - If image still too large after quality=20, drop the image
+   - If total payload exceeds max_payload_size_bytes, drop oldest images
 
 ═══════════════════════════════════════════════════════════════════════════════
 ⚠️ Requirements
@@ -102,13 +104,15 @@ all chat messages.
 
 For providers with strict limits (like Grok), set:
   - max_image_size_bytes: 2097152 (2MB)
-  - compression_quality: 75
-  - max_image_dimension: 1024
+  - max_payload_size_bytes: 5242880 (5MB)
+  - recent_image_quality: 75
+  - old_image_quality: 30
 
 For providers with generous limits:
-  - max_image_size_bytes: 10485760 (10MB)
-  - compression_quality: 90
-  - max_image_dimension: 4096
+  - max_image_size_bytes: 5242880 (5MB)
+  - max_payload_size_bytes: 20971520 (20MB)
+  - recent_image_quality: 90
+  - old_image_quality: 50
 """
 
 from pydantic import BaseModel, Field
@@ -861,7 +865,7 @@ class Filter:
             # Calculate quality for this message's images (if quality gradient is enabled)
             def get_image_quality(relative_idx: int) -> int:
                 if not self.valves.enable_quality_gradient or total_images <= 1:
-                    return self.valves.compression_quality
+                    return self.valves.recent_image_quality
                 # Calculate quality based on position (0 = oldest, total_images-1 = newest)
                 # Recent images (higher index) get higher quality
                 absolute_idx = current_image_idx + relative_idx
