@@ -1,10 +1,10 @@
 """
 title: Dynamic Media Manager
 id: dynamic_media_manager
-author: jndao
-author_url: https://johndao.com
-repository_url: https://github.com/jndao/openwebui-toolkit
 description: Automatically manages large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports compression, size thresholds, quality gradients, vision model detection, and smart image dropping with OCR/VLM descriptions.
+author: jndao
+author_url: https://github.com/jndao
+repository_url: https://github.com/jndao/openwebui-toolkit
 version: 0.2.2
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 

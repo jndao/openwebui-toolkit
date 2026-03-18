@@ -1,9 +1,11 @@
 """
 title: Scrubber
+id: scrubber
 description: Advanced content scrubbing to prevent rendering of potentially malicious content.
 version: 0.1.3
-author_url: https://johndao.com
+author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
+license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 
 Overview:
   Filters and scrubs potentially malicious content from LLM responses. Validates image URLs,
