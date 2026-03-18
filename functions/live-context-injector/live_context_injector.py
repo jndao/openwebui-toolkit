@@ -1,6 +1,6 @@
 """
 title: Live context injector
-id: live-context-injector
+id: live_context_injector
 description: Injects relevant live information to allow models to be more aware of the live context of a chat.
 version: 0.0.2
 author_url: https://github.com/jndao

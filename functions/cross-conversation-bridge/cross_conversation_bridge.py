@@ -1,6 +1,6 @@
 """
 title: Cross-Conversation Bridge
-id: cross-conversation-bridge
+id: cross_conversation_bridge
 description: Search and retrieve relevant context from your past conversations to enrich the current chat.
 version: 0.0.1
 author_url: https://github.com/jndao
