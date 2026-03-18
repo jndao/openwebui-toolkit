@@ -3,8 +3,8 @@ title: Dynamic Media Manager
 id: dynamic_media_manager
 author: jndao
 author_url: https://github.com/jndao
-description: Automatically manages large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports compression, size thresholds, quality gradients, and vision model detection.
-version: 0.2.1
+description: Automatically manages large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports compression, size thresholds, quality gradients, vision model detection, and smart image dropping with OCR/VLM descriptions.
+version: 0.2.2
 license: MIT
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -78,6 +78,18 @@ drop_images_for_non_vision
   Default: true
   Description: If the model doesn't support vision and this is enabled, all images will be dropped and replaced with a text placeholder. Requires enable_vision_detection to be true.
 
+enable_smart_drop
+  Default: true
+  Description: When dropping images for non-vision models, attempt to generate text descriptions (OCR) instead of just placeholder text.
+
+description_quality
+  Default: medium
+  Description: Quality of image descriptions. Options: low (brief), medium (standard), high (detailed). Higher quality takes longer to generate.
+
+use_ocr
+  Default: true
+  Description: Use OCR to extract text from images when generating descriptions. Uses RapidOCR (included in Open WebUI dependencies).
+
 ═══════════════════════════════════════════════════════════════════════════════
 🔧 How It Works
 ═══════════════════════════════════════════════════════════════════════════════
@@ -105,26 +117,6 @@ This filter requires Pillow (PIL) to be installed:
 
 Open WebUI typically includes Pillow, but if you encounter errors,
 you may need to install it manually in your environment.
-
-═══════════════════════════════════════════════════════════════════════════════
-📝 Usage Example
-═══════════════════════════════════════════════════════════════════════════════
-
-Simply install this filter and configure the thresholds according to your
-LLM provider's limits. The filter will automatically process images in
-all chat messages.
-
-For providers with strict limits (like Grok), set:
-  - max_image_size_bytes: 2097152 (2MB)
-  - max_payload_size_bytes: 5242880 (5MB)
-  - recent_image_quality: 75
-  - old_image_quality: 30
-
-For providers with generous limits:
-  - max_image_size_bytes: 5242880 (5MB)
-  - max_payload_size_bytes: 20971520 (20MB)
-  - recent_image_quality: 90
-  - old_image_quality: 50
 """
 
 from pydantic import BaseModel, Field
@@ -254,38 +246,11 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f}TB"
 
 
-# Patterns that indicate a vision-capable model
-VISION_MODEL_PATTERNS = [
-    r"llava",
-    r"vision",
-    r"multimodal",
-    r"gpt-4v",
-    r"gpt-4o",  # GPT-4 Omni supports vision
-    r"claude-3.*vision",
-    r"claude-3\.5.*sonnet",  # Sonnet supports vision
-    r"gemini.*pro",  # Gemini Pro supports vision
-    r"qwen-vl",
-    r"yi-vision",
-    r"bakllava",
-    r"cogvlm",
-    r"minicpm-v",
-    r"internvl",
-    r"deepseek-vl",
-    r"fuyu",
-    r"paligemma",
-    r"phi-3\.5.*vision",
-    r"llama.*vision",
-    r"mistral.*vision",
-]
-
-
 def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
     """
     Check if a model supports vision capabilities.
     
-    Checks:
-    1. Explicit capabilities in model["info"]["meta"]["capabilities"]["vision"]
-    2. Model name pattern matching as fallback
+    Checks Explicit capabilities in model["info"]["meta"]["capabilities"]["vision"]
     
     Args:
         model: The model dictionary from __model__ parameter
@@ -304,16 +269,100 @@ def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
         if "vision" in capabilities:
             return bool(capabilities["vision"])
     
-    # Fallback: Check model name patterns
-    model_id = model.get("id", "").lower()
-    model_name = model.get("name", "").lower()
-    
-    for pattern in VISION_MODEL_PATTERNS:
-        if re.search(pattern, model_id) or re.search(pattern, model_name):
-            return True
-    
     # Default to True if we can't determine - safer to keep images
     return True
+
+
+# Try to import RapidOCR for OCR (already included in Open WebUI dependencies)
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    RAPIDOCR_AVAILABLE = True
+    # Create global OCR engine
+    _ocr_engine = RapidOCR()
+except ImportError:
+    RAPIDOCR_AVAILABLE = False
+    _ocr_engine = None
+    logger.warning("[Dynamic Media Manager] rapidocr-onnxruntime not installed. OCR will be disabled.")
+    
+
+def extract_text_from_image(base64_data: str, debug: bool = False) -> Optional[str]:
+    """
+    Extract text from an image using RapidOCR.
+    
+    Args:
+        base64_data: Base64-encoded image data
+        debug: Enable debug logging
+        
+    Returns:
+        Extracted text or None if extraction failed
+    """
+    if not RAPIDOCR_AVAILABLE or _ocr_engine is None:
+        if debug:
+            logger.info("[Dynamic Media Manager] RapidOCR not available for OCR")
+        return None
+    
+    try:
+        # Decode base64 to image bytes
+        image_bytes = base64.b64decode(base64_data)
+        
+        # Run OCR
+        result, elapsed = _ocr_engine(image_bytes)
+        
+        if result is None or len(result) == 0:
+            return None
+        
+        # Extract all text from OCR results
+        text_lines = []
+        for line in result:
+            # result format: [box, text, confidence]
+            if len(line) >= 2 and line[1]:
+                text_lines.append(line[1])
+        
+        text = " ".join(text_lines).strip()
+        
+        if text and debug:
+            logger.info(f"[Dynamic Media Manager] RapidOCR extracted {len(text)} characters in {elapsed:.2f}s")
+        
+        return text if text else None
+    except Exception as e:
+        if debug:
+            logger.info(f"[Dynamic Media Manager] RapidOCR failed: {e}")
+        return None
+
+
+def generate_smart_image_description(
+    base64_data: str,
+    use_ocr: bool = True,
+    debug: bool = False,
+) -> str:
+    """
+    Generate a smart description of an image using OCR and/or VLM.
+    
+    Args:
+        base64_data: Base64-encoded image data
+        quality: Description quality (low, medium, high)
+        use_ocr: Whether to use OCR
+        model_info: Model information for VLM
+        debug: Enable debug logging
+        
+    Returns:
+        Generated description or fallback text
+    """
+    description_parts = []
+    
+    # Try OCR first (fast, no API needed)
+    if use_ocr and RAPIDOCR_AVAILABLE:
+        ocr_text = extract_text_from_image(base64_data, debug)
+        if ocr_text:
+            description_parts.append(f"[OCR Text]: {ocr_text}")
+            if debug:
+                logger.info(f"[Dynamic Media Manager] OCR found text: {ocr_text[:100]}...")
+    
+    if description_parts:
+        return " ".join(description_parts)
+    
+    # Fallback
+    return "[Image content not available - could not extract description]"
 
 
 # =============================================================================
@@ -596,6 +645,21 @@ class Filter:
         drop_images_for_non_vision: bool = Field(
             default=True,
             description="If the model doesn't support vision and this is enabled, all images will be dropped and replaced with a text placeholder. Requires enable_vision_detection to be true.",
+        )
+        
+        enable_smart_drop: bool = Field(
+            default=True,
+            description="When dropping images for non-vision models, attempt to generate text descriptions (OCR) instead of just placeholder text.",
+        )
+        
+        description_quality: str = Field(
+            default="medium",
+            description="Quality of image descriptions. Options: low (brief), medium (standard), high (detailed). Higher quality takes longer to generate.",
+        )
+        
+        use_ocr: bool = Field(
+            default=True,
+            description="Use OCR to extract text from images when generating descriptions. Uses RapidOCR (included in Open WebUI dependencies).",
         )
     
     def _log(self, message: str, level: str = "info"):
@@ -886,6 +950,7 @@ class Filter:
                 # Drop all images and replace with text placeholder
                 self._log("Model doesn't support vision, dropping all images")
                 dropped_count = 0
+                descriptions_generated = 0
                 
                 for message in messages:
                     if not isinstance(message, dict):
@@ -900,26 +965,87 @@ class Filter:
                         new_content = []
                         for part in content:
                             if isinstance(part, dict) and part.get("type") == "image_url":
+                                # Try to generate a description if smart drop is enabled
+                                placeholder_text = "[Image dropped - model doesn't support vision]"
+                                
+                                if self.valves.enable_smart_drop:
+                                    # Extract base64 data from the image
+                                    image_url = part.get("image_url", {})
+                                    if isinstance(image_url, dict):
+                                        url = image_url.get("url", "")
+                                    else:
+                                        url = image_url
+                                    
+                                    base64_data, _, _ = extract_base64_data(url)
+                                    
+                                    if base64_data:
+                                        description = generate_smart_image_description(
+                                            base64_data,
+                                            use_ocr=self.valves.use_ocr,
+                                            debug=self.valves.debug_mode,
+                                        )
+                                        if description and description != "[Image content not available - could not extract description]":
+                                            placeholder_text = f"[Image: {description}]"
+                                            descriptions_generated += 1
+                                            self._log(f"Generated description for dropped image: {description[:100]}...")
+                                        else:
+                                            placeholder_text = "[Image dropped - model doesn't support vision]"
+                                    else:
+                                        self._log("Could not extract base64 data for smart description")
+                                else:
+                                    if self.valves.debug_mode:
+                                        self._log("Smart drop disabled, using simple placeholder")
+                                
                                 new_content.append({
                                     "type": "text",
-                                    "text": "[Image dropped - model doesn't support vision]"
+                                    "text": placeholder_text
                                 })
                                 dropped_count += 1
                             else:
                                 new_content.append(part)
                         message["content"] = new_content
                     elif isinstance(content, dict) and content.get("type") == "image_url":
+                        # Try to generate a description if smart drop is enabled
+                        placeholder_text = "[Image dropped - model doesn't support vision]"
+                        
+                        if self.valves.enable_smart_drop:
+                            image_url = content.get("image_url", {})
+                            if isinstance(image_url, dict):
+                                url = image_url.get("url", "")
+                            else:
+                                url = image_url
+                            
+                            base64_data, _, _ = extract_base64_data(url)
+                            
+                            if base64_data:
+                                description = generate_smart_image_description(
+                                    base64_data,
+                                    quality=self.valves.description_quality,
+                                    use_ocr=self.valves.use_ocr,
+                                    model_info=__model__,
+                                    debug=self.valves.debug_mode,
+                                )
+                                if description and description != "[Image content not available - could not extract description]":
+                                    placeholder_text = f"[Image: {description}]"
+                                    descriptions_generated += 1
+                                    self._log(f"Generated description for dropped image: {description[:100]}...")
+                                else:
+                                    placeholder_text = "[Image dropped - model doesn't support vision]"
+                        
                         message["content"] = [
-                            {"type": "text", "text": "[Image dropped - model doesn't support vision]"}
+                            {"type": "text", "text": placeholder_text}
                         ]
                         dropped_count += 1
                 
                 if dropped_count > 0:
+                    status_msg = f"🖼️ Dropped {dropped_count} image(s) - model doesn't support vision"
+                    if descriptions_generated > 0:
+                        status_msg += f" ({descriptions_generated} with descriptions)"
                     await self._emit_status(
-                        f"🖼️ Dropped {dropped_count} image(s) - model doesn't support vision",
+                        status_msg,
                         __event_emitter__,
                     )
-                    self._log(f"Dropped {dropped_count} image(s) due to no vision support")
+                    self._log(f"Dropped {dropped_count} image(s) due to no vision support ({descriptions_generated} with descriptions)")
                 
                 return body
         
