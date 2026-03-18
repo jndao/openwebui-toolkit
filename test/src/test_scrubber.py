@@ -3,7 +3,7 @@
 Final verification test for the complete scrubber implementation
 """
 
-from src.functions.scrubber import ImageScrubber, PIIScrubber, CredentialScrubber, Filter
+from functions.scrubber.scrubber import ImageScrubber, PIIScrubber, CredentialScrubber, Filter
 import re
 
 def run_tests():
