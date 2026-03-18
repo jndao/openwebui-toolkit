@@ -27,63 +27,6 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-
-def format_time_since(timestamp_str: str) -> str:
-    """Format a timestamp as human-readable time since now."""
-    try:
-        parsed_time = None
-        
-        # Try parsing ISO format with timezone
-        try:
-            parsed_time = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-        except ValueError:
-            pass
-        
-        # Try parsing without timezone
-        if parsed_time is None:
-            try:
-                parsed_time = datetime.fromisoformat(timestamp_str)
-            except ValueError:
-                pass
-        
-        # Try parsing as simple datetime string
-        if parsed_time is None:
-            try:
-                parsed_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                pass
-        
-        if parsed_time is None:
-            return "unknown"
-        
-        # Get current time in UTC
-        now = datetime.now(timezone.utc)
-        
-        # If parsed time is naive (no timezone), assume UTC
-        if parsed_time.tzinfo is None:
-            parsed_time = parsed_time.replace(tzinfo=timezone.utc)
-        
-        # Calculate difference
-        diff = now - parsed_time.replace(tzinfo=timezone.utc)
-        total_seconds = int(diff.total_seconds())
-        
-        if total_seconds < 0:
-            return "just now"
-        elif total_seconds < 60:
-            return f"{total_seconds} seconds ago"
-        elif total_seconds < 3600:
-            minutes = total_seconds // 60
-            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-        elif total_seconds < 86400:
-            hours = total_seconds // 3600
-            return f"{hours} hour{'s' if hours != 1 else ''} ago"
-        else:
-            days = total_seconds // 86400
-            return f"{days} day{'s' if days != 1 else ''} ago"
-    except Exception:
-        return "unknown"
-
-
 def get_chat_metadata(chat_id: str, debug_mode: bool = False) -> dict:
     """Get chat metadata including time since created, title, and message count."""
     result = {
