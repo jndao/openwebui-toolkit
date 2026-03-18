@@ -7,6 +7,31 @@ description: Automatically manages large media (images, videos) in messages to p
 version: 0.2.2
 license: MIT
 
+Overview:
+  Compresses images in chat messages to prevent 413 errors. Applies quality gradient
+  (recent images = higher quality, older = lower). Supports PNG→JPEG conversion, vision
+  model detection, and OCR-based image descriptions for non-vision models.
+
+Configuration:
+  priority: 15 (runs after context compression at 10)
+  max_image_size_bytes: 1048576 (1MB) - images above this are compressed
+  max_payload_size_bytes: 10485760 (10MB) - oldest images dropped if exceeded
+  enable_quality_gradient: true - recent images get higher quality
+  recent_image_quality: 85 (0-100)
+  old_image_quality: 40 (0-100)
+  convert_png_to_jpeg: true - better compression
+  preserve_transparency: true - transparent PNGs → WebP
+  enable_status_notifications: true - show compression status
+  debug_mode: false
+  enable_vision_detection: true - check model vision capabilities
+  drop_images_for_non_vision: true - drop images for non-vision models
+  enable_smart_drop: true - generate OCR descriptions for dropped images
+  description_quality: medium (low/medium/high)
+  use_ocr: true - extract text via RapidOCR
+
+Requirements: Pillow (PIL) - typically included in Open WebUI
+"""
+
 ═══════════════════════════════════════════════════════════════════════════════
 📌 Overview
 ═══════════════════════════════════════════════════════════════════════════════

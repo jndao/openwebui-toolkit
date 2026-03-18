@@ -2,6 +2,20 @@
 title: Scrubber
 description: Advanced content scrubbing to prevent rendering of potentially malicious content.
 version: 0.1.3
+
+Overview:
+  Filters and scrubs potentially malicious content from LLM responses. Validates image URLs,
+  removes dangerous HTML tags/scripts, and sanitizes JSON/SSE streams. Runs in outlet phase.
+
+Configuration:
+  priority: 90 - filter execution order
+  enable_html_scrubbing: true - remove dangerous HTML tags
+  enable_json_scrubbing: true - sanitize JSON output
+  enable_image_validation: true - validate image URLs
+  allowed_html_tags: ["b", "i", "em", "strong", "code", "pre", "br", "p", "ul", "ol", "li", "a", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "span"]
+  debug_mode: false
+
+Requirements: None (pure Python)
 """
 
 from pydantic import BaseModel

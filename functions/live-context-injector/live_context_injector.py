@@ -2,6 +2,16 @@
 title: Live context injector
 description: Injects relevant live information to allow models to be more aware of the live context of a chat.
 version: 0.0.2
+
+Overview:
+  Injects live user/context information (datetime, timezone, user details) into system messages
+  so models can be aware of the current context. Updates existing live_context blocks.
+
+Configuration:
+  priority: 100 - filter execution order
+  debug_mode: false
+
+Requirements: Open WebUI variables (USER_NAME, USER_EMAIL, CURRENT_DATETIME, etc.)
 """
 
 import logging

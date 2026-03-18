@@ -2,6 +2,22 @@
 title: Cross-Conversation Bridge
 description: Search and retrieve relevant context from your past conversations to enrich the current chat.
 version: 0.0.1
+
+Overview:
+  Searches past conversations and injects relevant context into current chats. Uses AI to
+  extract keywords and rank conversations by relevance. Toggleable filter for on-demand use.
+
+Configuration:
+  priority: 100 - filter execution order
+  max_results: 5 (1-20) - past conversations to retrieve
+  max_interactions_per_chat: 3 (1-5) - user-AI pairs per chat (~6 messages)
+  keyword_model: "" - model for AI operations (defaults to current model)
+  debug_mode: false
+  lookback_days: 30 (0-365) - search within N days, 0 = all time
+  max_candidates: 50 (10-200) - candidate chats before AI ranking
+  min_relevance_threshold: 0.75 (0-1) - minimum relevance score to include
+
+Requirements: Open WebUI models (Chats, Users)
 """
 
 from pydantic import BaseModel, Field
