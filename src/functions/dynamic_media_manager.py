@@ -1,10 +1,10 @@
 """
-title: Dynamic Media Compressor
-id: dynamic_media_compressor
+title: Dynamic Media Manager
+id: dynamic_media_manager
 author: jndao
 author_url: https://github.com/jndao
-description: Automatically compresses large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports configurable size thresholds and quality gradients.
-version: 0.1.1
+description: Automatically manages large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports compression, size thresholds, quality gradients, and vision model detection.
+version: 0.2.1
 license: MIT
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -70,6 +70,14 @@ debug_mode
   Default: false
   Description: Enable detailed debug logging.
 
+enable_vision_detection
+  Default: true
+  Description: Enable detection of vision capabilities. When enabled, the filter will check if the model supports vision and can optionally drop images for non-vision models.
+
+drop_images_for_non_vision
+  Default: true
+  Description: If the model doesn't support vision and this is enabled, all images will be dropped and replaced with a text placeholder. Requires enable_vision_detection to be true.
+
 ═══════════════════════════════════════════════════════════════════════════════
 🔧 How It Works
 ═══════════════════════════════════════════════════════════════════════════════
@@ -80,7 +88,11 @@ debug_mode
    - Applies quality gradient (recent images = higher quality, older = lower)
    - Compresses images using PIL/Pillow
 
-2. Fallback Strategy:
+2. Vision Model Detection:
+   - Checks if the model supports vision via capabilities
+   - If model doesn't support vision and drop_images_for_non_vision is enabled, drops all images
+
+3. Fallback Strategy:
    - If image still too large after quality=20, drop the image
    - If total payload exceeds max_payload_size_bytes, drop oldest images
 
@@ -240,6 +252,68 @@ def format_size(size_bytes: int) -> str:
             return f"{size_bytes:.1f}{unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f}TB"
+
+
+# Patterns that indicate a vision-capable model
+VISION_MODEL_PATTERNS = [
+    r"llava",
+    r"vision",
+    r"multimodal",
+    r"gpt-4v",
+    r"gpt-4o",  # GPT-4 Omni supports vision
+    r"claude-3.*vision",
+    r"claude-3\.5.*sonnet",  # Sonnet supports vision
+    r"gemini.*pro",  # Gemini Pro supports vision
+    r"qwen-vl",
+    r"yi-vision",
+    r"bakllava",
+    r"cogvlm",
+    r"minicpm-v",
+    r"internvl",
+    r"deepseek-vl",
+    r"fuyu",
+    r"paligemma",
+    r"phi-3\.5.*vision",
+    r"llama.*vision",
+    r"mistral.*vision",
+]
+
+
+def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
+    """
+    Check if a model supports vision capabilities.
+    
+    Checks:
+    1. Explicit capabilities in model["info"]["meta"]["capabilities"]["vision"]
+    2. Model name pattern matching as fallback
+    
+    Args:
+        model: The model dictionary from __model__ parameter
+        
+    Returns:
+        True if model supports vision, False otherwise
+    """
+    if not model:
+        # No model info - assume supports vision to be safe
+        return True
+    
+    # Check explicit capabilities (from Open WebUI model settings)
+    capabilities = model.get("info", {}).get("meta", {}).get("capabilities", {})
+    if capabilities is not None:
+        # If explicitly set, use that value
+        if "vision" in capabilities:
+            return bool(capabilities["vision"])
+    
+    # Fallback: Check model name patterns
+    model_id = model.get("id", "").lower()
+    model_name = model.get("name", "").lower()
+    
+    for pattern in VISION_MODEL_PATTERNS:
+        if re.search(pattern, model_id) or re.search(pattern, model_name):
+            return True
+    
+    # Default to True if we can't determine - safer to keep images
+    return True
 
 
 # =============================================================================
@@ -513,6 +587,16 @@ class Filter:
             default=False,
             description="Enable detailed debug logging.",
         )
+        
+        enable_vision_detection: bool = Field(
+            default=True,
+            description="Enable detection of vision capabilities. When enabled, the filter will check if the model supports vision and can optionally drop images for non-vision models.",
+        )
+        
+        drop_images_for_non_vision: bool = Field(
+            default=True,
+            description="If the model doesn't support vision and this is enabled, all images will be dropped and replaced with a text placeholder. Requires enable_vision_detection to be true.",
+        )
     
     def _log(self, message: str, level: str = "info"):
         """Log message with appropriate level."""
@@ -772,6 +856,7 @@ class Filter:
         __metadata__: Optional[dict] = None,
         __event_emitter__: Optional[callable] = None,
         __event_call__: Optional[callable] = None,
+        __model__: Optional[dict] = None,
     ) -> dict:
         """
         Process messages before sending to LLM.
@@ -791,6 +876,52 @@ class Filter:
         messages = body.get("messages", [])
         if not messages:
             return body
+        
+        # Check if model supports vision (if vision detection is enabled)
+        if self.valves.enable_vision_detection:
+            supports_vision = model_supports_vision(__model__)
+            self._log(f"Model vision support: {supports_vision}")
+            
+            if not supports_vision and self.valves.drop_images_for_non_vision:
+                # Drop all images and replace with text placeholder
+                self._log("Model doesn't support vision, dropping all images")
+                dropped_count = 0
+                
+                for message in messages:
+                    if not isinstance(message, dict):
+                        continue
+                    
+                    content = message.get("content")
+                    if not content:
+                        continue
+                    
+                    # Check if this message has images
+                    if isinstance(content, list):
+                        new_content = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "image_url":
+                                new_content.append({
+                                    "type": "text",
+                                    "text": "[Image dropped - model doesn't support vision]"
+                                })
+                                dropped_count += 1
+                            else:
+                                new_content.append(part)
+                        message["content"] = new_content
+                    elif isinstance(content, dict) and content.get("type") == "image_url":
+                        message["content"] = [
+                            {"type": "text", "text": "[Image dropped - model doesn't support vision]"}
+                        ]
+                        dropped_count += 1
+                
+                if dropped_count > 0:
+                    await self._emit_status(
+                        f"🖼️ Dropped {dropped_count} image(s) - model doesn't support vision",
+                        __event_emitter__,
+                    )
+                    self._log(f"Dropped {dropped_count} image(s) due to no vision support")
+                
+                return body
         
         # Debug: Log incoming message structure
         total_images = sum(self._count_images_in_content(msg.get("content")) for msg in messages if isinstance(msg, dict))
