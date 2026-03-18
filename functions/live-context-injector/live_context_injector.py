@@ -2,6 +2,9 @@
 title: Live context injector
 description: Injects relevant live information to allow models to be more aware of the live context of a chat.
 version: 0.0.2
+author_url: https://johndao.com
+repository_url: https://github.com/jndao/openwebui-toolkit
+license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 
 Overview:
   Injects live user/context information (datetime, timezone, user details) into system messages

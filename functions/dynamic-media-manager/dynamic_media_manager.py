@@ -2,10 +2,11 @@
 title: Dynamic Media Manager
 id: dynamic_media_manager
 author: jndao
-author_url: https://github.com/jndao
+author_url: https://johndao.com
+repository_url: https://github.com/jndao/openwebui-toolkit
 description: Automatically manages large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports compression, size thresholds, quality gradients, vision model detection, and smart image dropping with OCR/VLM descriptions.
 version: 0.2.2
-license: MIT
+license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 
 Overview:
   Compresses images in chat messages to prevent 413 errors. Applies quality gradient
@@ -30,118 +31,6 @@ Configuration:
   use_ocr: true - extract text via RapidOCR
 
 Requirements: Pillow (PIL) - typically included in Open WebUI
-"""
-
-═══════════════════════════════════════════════════════════════════════════════
-📌 Overview
-═══════════════════════════════════════════════════════════════════════════════
-
-This filter automatically compresses media (primarily images) in chat messages when they exceed
-a configurable size threshold. This helps prevent "413 Request Entity Too Large"
-errors when sending messages with large media to LLM providers.
-
-Core Features:
-  ✅ Automatic detection of base64-encoded images in messages
-  ✅ Configurable size threshold for triggering compression
-  ✅ Quality gradient - recent images get higher quality, older images get more compression
-  ✅ Support for multiple image formats (PNG, JPEG, GIF, WebP)
-  ✅ Automatic format conversion for better compression (PNG → JPEG when appropriate)
-  ✅ Detailed logging and status notifications
-  ✅ Runs AFTER context compression to process final message list
-  ✅ Fallback strategy: drops images when compression isn't sufficient
-
-═══════════════════════════════════════════════════════════════════════════════
-⚙️ Configuration
-═══════════════════════════════════════════════════════════════════════════════
-
-priority
-  Default: 15
-  Description: Filter priority. Set HIGHER than context compression (10) to process
-  the final message list after context compression has assembled it.
-
-max_image_size_bytes
-  Default: 1048576 (1MB)
-  Description: Maximum image size in bytes. Images larger than this will be compressed.
-
-max_payload_size_bytes
-  Default: 10485760 (10MB)
-  Description: Maximum total payload size. If exceeded, oldest images will be dropped.
-
-enable_quality_gradient
-  Default: true
-  Description: Enable quality gradient - recent images get higher quality, older images get more compression.
-
-recent_image_quality
-  Default: 85
-  Description: Compression quality for the most recent images (0-100). Higher = better quality, larger files.
-
-old_image_quality
-  Default: 40
-  Description: Compression quality for the oldest images (0-100). Lower = more compression, smaller files.
-
-convert_png_to_jpeg
-  Default: true
-  Description: Convert PNG images to JPEG for better compression.
-
-preserve_transparency
-  Default: true
-  Description: When enabled, transparent PNGs will be converted to WebP instead of JPEG to preserve transparency.
-
-enable_status_notifications
-  Default: true
-  Description: Show status notifications when images are compressed.
-
-debug_mode
-  Default: false
-  Description: Enable detailed debug logging.
-
-enable_vision_detection
-  Default: true
-  Description: Enable detection of vision capabilities. When enabled, the filter will check if the model supports vision and can optionally drop images for non-vision models.
-
-drop_images_for_non_vision
-  Default: true
-  Description: If the model doesn't support vision and this is enabled, all images will be dropped and replaced with a text placeholder. Requires enable_vision_detection to be true.
-
-enable_smart_drop
-  Default: true
-  Description: When dropping images for non-vision models, attempt to generate text descriptions (OCR) instead of just placeholder text.
-
-description_quality
-  Default: medium
-  Description: Quality of image descriptions. Options: low (brief), medium (standard), high (detailed). Higher quality takes longer to generate.
-
-use_ocr
-  Default: true
-  Description: Use OCR to extract text from images when generating descriptions. Uses RapidOCR (included in Open WebUI dependencies).
-
-═══════════════════════════════════════════════════════════════════════════════
-🔧 How It Works
-═══════════════════════════════════════════════════════════════════════════════
-
-1. Inlet Phase (Before LLM Request):
-   - Runs AFTER context compression (priority 15 > 10)
-   - Scans all messages for base64-encoded images
-   - Applies quality gradient (recent images = higher quality, older = lower)
-   - Compresses images using PIL/Pillow
-
-2. Vision Model Detection:
-   - Checks if the model supports vision via capabilities
-   - If model doesn't support vision and drop_images_for_non_vision is enabled, drops all images
-
-3. Fallback Strategy:
-   - If image still too large after quality=20, drop the image
-   - If total payload exceeds max_payload_size_bytes, drop oldest images
-
-═══════════════════════════════════════════════════════════════════════════════
-⚠️ Requirements
-═══════════════════════════════════════════════════════════════════════════════
-
-This filter requires Pillow (PIL) to be installed:
-  pip install Pillow
-
-Open WebUI typically includes Pillow, but if you encounter errors,
-you may need to install it manually in your environment.
 """
 
 from pydantic import BaseModel, Field
