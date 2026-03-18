@@ -2,6 +2,8 @@
 
 Welcome to my OpenWebUI toolkit!
 
+See my OpenWebUI profile for recent releases: https://openwebui.com/u/jndao
+
 This repo stores all the artifacts that I have developed to enrich the experience on OpenWebUI. This currently includes
 
 - Functions (filters, actions, pipes)
