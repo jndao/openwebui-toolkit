@@ -1,15 +1,17 @@
 """
-title: Live context injector
+title: Live Context Injector
 id: live_context_injector
 description: Injects relevant live information to allow models to be more aware of the live context of a chat.
-version: 0.0.2
+version: 0.0.3
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
+funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 
 Overview:
   Injects live user/context information (datetime, timezone, user details) into system messages
   so models can be aware of the current context. Updates existing live_context blocks.
+  Also adds chat metadata: Time Since Chat Created, Chat Title, Message Count.
 
 Configuration:
   priority: 100 - filter execution order
@@ -20,10 +22,71 @@ Requirements: Open WebUI variables (USER_NAME, USER_EMAIL, CURRENT_DATETIME, etc
 
 import logging
 import re
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+def get_chat_metadata(chat_id: str, debug_mode: bool = False) -> dict:
+    """Get chat metadata including time since created, title, and message count."""
+    result = {
+        "title": None,
+        "message_count": 0
+    }
+    
+    try:
+        from open_webui.models.chats import Chats
+        from open_webui.utils.misc import get_message_list
+        
+        chat = Chats.get_chat_by_id(chat_id)
+        if not chat:
+            return result
+        
+        now = datetime.now(timezone.utc)
+        
+        # Get message count from chat history
+        if chat.chat and isinstance(chat.chat, dict):
+            history = chat.chat.get("history", {})
+            messages_map = history.get("messages", {})
+            current_id = history.get("currentId")
+            
+            if messages_map and current_id:
+                message_list = get_message_list(messages_map, current_id)
+                if message_list:
+                    result["message_count"] = len(message_list)
+        
+        # Time since chat created (from created_at)
+        if chat.created_at:
+            created_time = datetime.fromtimestamp(chat.created_at, tz=timezone.utc)
+            diff = now - created_time
+            total_seconds = int(diff.total_seconds())
+            
+            if total_seconds < 60:
+                result["time_since_created"] = f"{total_seconds} seconds ago"
+            elif total_seconds < 3600:
+                minutes = total_seconds // 60
+                result["time_since_created"] = f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+            elif total_seconds < 86400:
+                hours = total_seconds // 3600
+                result["time_since_created"] = f"{hours} hour{'s' if hours != 1 else ''} ago"
+            else:
+                days = total_seconds // 86400
+                result["time_since_created"] = f"{days} day{'s' if days != 1 else ''} ago"
+        
+        # Chat title
+        if chat.title:
+            result["title"] = chat.title
+        
+        if debug_mode:
+            logger.info(f"[Live Context Injector] Chat metadata: {result}")
+            
+    except Exception as e:
+        if debug_mode:
+            logger.info(f"[Live Context Injector] Error getting chat metadata: {e}")
+    
+    return result
+
 
 class Filter:
     class Valves(BaseModel):
@@ -84,7 +147,24 @@ class Filter:
             location_status = "fallback to timezone" if location_fallback else "from user profile"
             logger.info(f"[Live Context Injector] Using variables - User: {user_name}, Location: {location_status}")
         
+        # Get chat metadata from chat's updated_at, created_at, title, and message count
+        chat_metadata = {"time_since_created": None, "title": None, "message_count": 0}
+        if __metadata__:
+            chat_id = __metadata__.get("chat_id")
+            if chat_id and not chat_id.startswith("local:"):
+                chat_metadata = get_chat_metadata(chat_id, self.valves.debug_mode)
+        
         # Build context template with variables from request
+        chat_context_lines = []
+        if chat_metadata.get("time_since_created"):
+            chat_context_lines.append(f"Time Since Chat Created: {chat_metadata['time_since_created']}")
+        if chat_metadata.get("title"):
+            chat_context_lines.append(f"Chat Title: {chat_metadata['title']}")
+        if chat_metadata.get("message_count"):
+            chat_context_lines.append(f"Message Count: {chat_metadata['message_count']}")
+        
+        chat_context_line = "\n".join(chat_context_lines) if chat_context_lines else ""
+        
         context_template = f"""<live_context>
 Current Datetime: {current_datetime}
 Current Date: {current_date}
@@ -95,6 +175,7 @@ User: {user_name}
 User Email: {user_email}
 User Location: {user_location}
 User Language: {user_language}
+{chat_context_line}
 </live_context>
 """
         
