@@ -1,10 +1,11 @@
 """
-title: Live context injector
+title: Live Context Injector
 id: live_context_injector
 description: Injects relevant live information to allow models to be more aware of the live context of a chat.
 version: 0.0.3
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
+funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 
 Overview:
@@ -30,7 +31,6 @@ logger = logging.getLogger(__name__)
 def get_chat_metadata(chat_id: str, debug_mode: bool = False) -> dict:
     """Get chat metadata including time since created, title, and message count."""
     result = {
-        "time_since_created": None,
         "title": None,
         "message_count": 0
     }
