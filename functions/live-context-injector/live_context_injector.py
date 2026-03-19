@@ -155,15 +155,15 @@ class Filter:
                 chat_metadata = get_chat_metadata(chat_id, self.valves.debug_mode)
         
         # Build context template with variables from request
-        time_since_lines = []
+        chat_context_lines = []
         if chat_metadata.get("time_since_created"):
-            time_since_lines.append(f"Time Since Chat Created: {chat_metadata['time_since_created']}")
+            chat_context_lines.append(f"Time Since Chat Created: {chat_metadata['time_since_created']}")
         if chat_metadata.get("title"):
-            time_since_lines.append(f"Chat Title: {chat_metadata['title']}")
+            chat_context_lines.append(f"Chat Title: {chat_metadata['title']}")
         if chat_metadata.get("message_count"):
-            time_since_lines.append(f"Message Count: {chat_metadata['message_count']}")
+            chat_context_lines.append(f"Message Count: {chat_metadata['message_count']}")
         
-        time_since_line = "\n".join(time_since_lines) if time_since_lines else ""
+        chat_context_line = "\n".join(chat_context_lines) if chat_context_lines else ""
         
         context_template = f"""<live_context>
 Current Datetime: {current_datetime}
@@ -175,7 +175,7 @@ User: {user_name}
 User Email: {user_email}
 User Location: {user_location}
 User Language: {user_language}
-{time_since_line}
+{chat_context_line}
 </live_context>
 """
         
