@@ -1,12 +1,31 @@
 """
 title: Live Context Injector
 id: live_context_injector
+<<<<<<< HEAD
 description: Injects live context (time, user, location) while preventing system message stacking and priority conflicts.
 version: 0.0.4
+=======
+description: Injects relevant live information to allow models to be more aware of the live context of a chat.
+version: 0.0.3
+>>>>>>> main
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
+<<<<<<< HEAD
+=======
+
+Overview:
+  Injects live user/context information (datetime, timezone, user details) into system messages
+  so models can be aware of the current context. Updates existing live_context blocks.
+  Also adds chat metadata: Time Since Chat Created, Chat Title, Message Count.
+
+Configuration:
+  priority: 100 - filter execution order
+  debug_mode: false
+
+Requirements: Open WebUI variables (USER_NAME, USER_EMAIL, CURRENT_DATETIME, etc.)
+>>>>>>> main
 """
 import logging
 import re
