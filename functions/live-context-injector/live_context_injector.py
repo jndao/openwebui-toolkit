@@ -1,7 +1,7 @@
 """
 title: Live Context Injector
 id: live_context_injector
-description: Injects live context (time, user, location) while preventing system message stacking and priority conflicts.
+description: Injects relevant live information to allow models to be more aware of the live context of a chat.
 version: 0.0.4
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
