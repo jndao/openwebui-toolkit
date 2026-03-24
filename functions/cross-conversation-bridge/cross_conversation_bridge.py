@@ -2,7 +2,7 @@
 title: Cross-Conversation Bridge
 id: cross_conversation_bridge
 description: Search and retrieve relevant context from your past conversations to enrich the current chat.
-version: 0.0.1
+version: 0.0.2
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
@@ -99,10 +99,14 @@ class Filter:
             le=1.0,
             description="Minimum relevance score (0-1) required to include a chat. Only chats with relevance >= threshold will be injected."
         )
+        toggleable: bool = Field(
+            default=False,
+            description="Run cross conversation bridge by default across all chats or toggled by users."
+        )
 
     def __init__(self):
         self.valves = self.Valves()
-        self.toggle = True  # Makes this a toggleable filter
+        self.toggle = self.valves.toggleable
         self.icon = "https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/icons/git-compare.svg"
 
     async def _call_ai(self, prompt: str, user_dict: dict) -> Optional[Any]:
