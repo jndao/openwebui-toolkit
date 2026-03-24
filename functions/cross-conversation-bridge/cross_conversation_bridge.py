@@ -45,10 +45,15 @@ class Filter:
         min_relevance_threshold: float = Field(
             default=0.75, ge=0.0, le=1.0, description="Min relevance score."
         )
+        toggleable: bool = Field(
+            default=False,
+            description="Run cross conversation bridge by default across all chats or toggled by users."
+        )
 
     def __init__(self):
         self.type = "filter"
         self.valves = self.Valves()
+<<<<<<< HEAD
         self.icon = (
             "https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/icons/git-compare.svg"
         )
@@ -56,6 +61,10 @@ class Filter:
     @property
     def toggle(self) -> bool:
         return self.valves.toggleable
+=======
+        self.toggle = self.valves.toggleable
+        self.icon = "https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/icons/git-compare.svg"
+>>>>>>> main
 
     async def _call_ai(self, prompt: str, user_dict: dict) -> Optional[Any]:
         from open_webui.utils.chat import generate_chat_completion
