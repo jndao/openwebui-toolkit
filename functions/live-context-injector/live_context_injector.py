@@ -5,6 +5,8 @@ description: Advanced environmental awareness (files, model, device, channel) fo
 version: 0.1.0-dev.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
+funding_url: https://ko-fi.com/jndao
+license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 """
 
 import logging
