@@ -2,9 +2,11 @@
 title: Live Context Injector
 id: live_context_injector
 description: Injects dynamic temporal, user, interface, and system runtime context for Open WebUI.
-version: 0.1.0
+version: 0.1.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
+funding_url: https://ko-fi.com/jndao
+license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 """
 
 import logging
