@@ -1,10 +1,13 @@
-# title: Cross-Conversation Bridge
-# id: cross_conversation_bridge
-# description: Search and retrieve relevant context from your past conversations to enrich the current chat.
-# version: 0.0.3
-# author_url: https://github.com/jndao
-# repository_url: https://github.com/jndao/openwebui-toolkit
-# license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
+'''
+title: Cross-Conversation Bridge
+id: cross_conversation_bridge
+description: Search and retrieve relevant context from your past conversations to enrich the current chat.
+version: 0.0.3
+author_url: https://github.com/jndao
+repository_url: https://github.com/jndao/openwebui-toolkit
+funding_url: https://ko-fi.com/jndao
+license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
+'''
 
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
