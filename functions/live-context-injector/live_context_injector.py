@@ -1,8 +1,8 @@
 """
 title: Live Context Injector
 id: live_context_injector
-description: Injects dynamic temporal, user, and system runtime context with truncated module lists and environment facts.
-version: 0.1.0-dev.3
+description: Injects dynamic temporal, user, interface, and system runtime context for Open WebUI.
+version: 0.1.0
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 """
@@ -32,13 +32,42 @@ def format_duration(seconds: int) -> str:
     return f"{days}d {hours}h ago"
 
 
+def parse_ua(ua_string: str) -> dict:
+    """Simple regex-based User-Agent parser for OS and Browser detection."""
+    ua = ua_string.lower()
+    res = {"os": "Unknown", "browser": "Unknown", "device": "Desktop"}
+
+    if "windows" in ua:
+        res["os"] = "Windows"
+    elif "macintosh" in ua or "mac os" in ua:
+        res["os"] = "macOS"
+    elif "android" in ua:
+        res["os"], res["device"] = "Android", "Mobile"
+    elif "iphone" in ua or "ipad" in ua:
+        res["os"], res["device"] = "iOS", "Mobile"
+    elif "linux" in ua:
+        res["os"] = "Linux"
+
+    if "edg/" in ua:
+        res["browser"] = "Edge"
+    elif "chrome/" in ua and "safari/" in ua:
+        res["browser"] = "Chrome"
+    elif "firefox/" in ua:
+        res["browser"] = "Firefox"
+    elif "safari/" in ua:
+        res["browser"] = "Safari"
+
+    return res
+
+
 def get_chat_data(chat_id: str, debug: bool = False) -> dict:
-    """Fetches chat metadata and calculates interaction age from the database."""
+    """Fetches chat metadata and calculates interaction metrics from the database."""
     data = {
         "title": "New Chat",
         "msg_count": 0,
         "chat_age": "Just now",
         "interaction_age": "N/A",
+        "velocity": "N/A",
     }
     try:
         from open_webui.models.chats import Chats
@@ -49,9 +78,11 @@ def get_chat_data(chat_id: str, debug: bool = False) -> dict:
             return data
 
         now = datetime.now(timezone.utc)
+        total_seconds = 0
         if chat.created_at:
             created_dt = datetime.fromtimestamp(chat.created_at, tz=timezone.utc)
-            data["chat_age"] = format_duration(int((now - created_dt).total_seconds()))
+            total_seconds = int((now - created_dt).total_seconds())
+            data["chat_age"] = format_duration(total_seconds)
 
         if chat.chat and isinstance(chat.chat, dict):
             history = chat.chat.get("history", {})
@@ -60,10 +91,16 @@ def get_chat_data(chat_id: str, debug: bool = False) -> dict:
             if messages_map and current_id:
                 msg_list = get_message_list(messages_map, current_id)
                 data["msg_count"] = len(msg_list)
+
+                if data["msg_count"] > 1:
+                    avg_seconds = total_seconds // (data["msg_count"] // 2)
+                    data["velocity"] = (
+                        f"Avg {format_duration(avg_seconds).replace(' ago', '')} per turn"
+                    )
+
                 user_msgs = [m for m in msg_list if m.get("role") == "user"]
                 if len(user_msgs) > 1:
-                    prev_msg = user_msgs[-2]
-                    prev_ts = prev_msg.get("timestamp")
+                    prev_ts = user_msgs[-2].get("timestamp")
                     if prev_ts:
                         prev_dt = datetime.fromtimestamp(prev_ts, tz=timezone.utc)
                         data["interaction_age"] = format_duration(
@@ -80,16 +117,17 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(default=5, description="Filter execution order.")
         debug_mode: bool = Field(default=False, description="Enable debug logging.")
-        max_modules: int = Field(
-            default=50,
-            description="Maximum number of modules to list before truncating.",
-        )
 
     def __init__(self):
         self.valves = self.Valves()
 
     async def inlet(
-        self, body: dict, __user__: dict = None, __metadata__: dict = None, **kwargs
+        self,
+        body: dict,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __request__=None,
+        **kwargs,
     ):
         messages = body.get("messages", [])
         if not messages:
@@ -104,58 +142,34 @@ class Filter:
             "msg_count": len(messages),
             "chat_age": "New",
             "interaction_age": "N/A",
+            "velocity": "N/A",
         }
         if chat_id and not chat_id.startswith("local:"):
             chat_info = get_chat_data(chat_id, self.valves.debug_mode)
 
-        # Location Fallback Logic
+        user_tz = __user__.get("timezone", "UTC")
         user_location = __user__.get("location")
-        user_tz = __user__.get("timezone", "Australia/Sydney")
         if not user_location or user_location.lower() == "unknown":
             user_location = f"{user_tz} (Timezone Fallback)"
 
-        # Filesystem Discovery
-        files_str = "None"
-        storage_str = "Unknown"
+        ua_data = {"os": "Unknown", "browser": "Unknown", "device": "Desktop"}
+        if __request__:
+            ua_string = __request__.headers.get("user-agent", "")
+            ua_data = parse_ua(ua_string)
+
+        files_str, storage_str = "None", "Unknown"
         try:
             upload_dir = "/mnt/uploads/"
-            file_list = []
-            for f in os.listdir(upload_dir):
-                f_path = os.path.join(upload_dir, f)
-                size = os.path.getsize(f_path)
-                size_str = (
-                    f"{size/1024:.1f} KB"
-                    if size < 1024**2
-                    else f"{size/1024**2:.1f} MB"
-                )
-                file_list.append(f"- {f} ({size_str})")
+            file_list = [
+                f"- {f} ({os.path.getsize(os.path.join(upload_dir, f))/1024:.1f} KB)"
+                for f in os.listdir(upload_dir)
+            ]
             if file_list:
                 files_str = "\n        ".join(file_list)
-
             usage = shutil.disk_usage("/")
             storage_str = f"{usage.free / (1024**3):.1f} GB free / {usage.total / (1024**3):.1f} GB total"
         except:
             pass
-
-        # Dynamic Module Detection with Truncation
-        all_libs = sorted(
-            list(
-                set(
-                    [
-                        m.split(".")[0]
-                        for m in sys.modules.keys()
-                        if not m.startswith("_")
-                    ]
-                )
-            )
-        )
-        if len(all_libs) > self.valves.max_modules:
-            libs_display = (
-                ", ".join(all_libs[: self.valves.max_modules])
-                + f" ... (+{len(all_libs) - self.valves.max_modules} more)"
-            )
-        else:
-            libs_display = ", ".join(all_libs)
 
         context_xml = f"""<live_context>
   <temporal>
@@ -163,12 +177,18 @@ class Filter:
     <timezone>{user_tz}</timezone>
     <chat_age>{chat_info['chat_age']}</chat_age>
     <last_interaction_age>{chat_info['interaction_age']}</last_interaction_age>
+    <interaction_velocity>{chat_info['velocity']}</interaction_velocity>
   </temporal>
 
   <user_profile>
     <name>{__user__.get('name', 'Unknown')}</name>
-    <role>{__user__.get('role', 'admin')}</role>
+    <role>{__user__.get('role', 'user')}</role>
     <location>{user_location}</location>
+    <interface>
+      <os>{ua_data['os']}</os>
+      <browser>{ua_data['browser']}</browser>
+      <device_type>{ua_data['device']}</device_type>
+    </interface>
   </user_profile>
 
   <session_info>
@@ -183,14 +203,12 @@ class Filter:
     <constraints>
       - Environment: Browser-based (Pyodide).
       - Package Management: pip, subprocess, and micropip.install() are unavailable.
+      - Do not attempt to install packages. If a library is missing, use an alternative approach.
     </constraints>
-    <capabilities>
-      <loaded_modules>{libs_display}</loaded_modules>
-    </capabilities>
     <filesystem>
       <storage_status>{storage_str}</storage_status>
       <mount_point>/mnt/uploads/</mount_point>
-      <persistence>Files at /mnt/uploads/ persist across executions in this session. Output files written here are accessible to the user.</persistence>
+      <persistence>Files at /mnt/uploads/ persist across executions. Output files written here are accessible to the user.</persistence>
       <active_files>
         {files_str}
       </active_files>
@@ -201,8 +219,9 @@ class Filter:
         pattern = r"<live_context>[\s\S]*?</live_context>\n?\n?"
         if messages[0].get("role") == "system":
             content = messages[0].get("content", "")
-            messages[0]["content"] = re.sub(pattern, "", content).strip()
-            messages[0]["content"] = context_xml + "\n\n" + messages[0]["content"]
+            messages[0]["content"] = (
+                context_xml + "\n\n" + re.sub(pattern, "", content).strip()
+            )
         else:
             messages.insert(0, {"role": "system", "content": context_xml})
 
