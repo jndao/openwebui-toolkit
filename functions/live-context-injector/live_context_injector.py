@@ -2,7 +2,7 @@
 title: Live Context Injector
 id: live_context_injector
 description: Advanced environmental awareness (files, model, device, channel) for Open WebUI.
-version: 0.1.0
+version: 0.1.0-dev.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 """
