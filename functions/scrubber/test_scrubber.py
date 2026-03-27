@@ -185,7 +185,7 @@ def run_tests():
     
     print()
     print('✅ All tests passed!')
-    print('LOG: Scrubber v0.1.4 - ToolScrubber validation complete')
+    print('LOG: ToolScrubber validation complete')
 
     print()
     print('=' * 60)
