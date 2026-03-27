@@ -2,7 +2,7 @@
 title: Scrubber
 id: scrubber
 description: Advanced content scrubbing to prevent rendering of potentially malicious content and fix malformed tool calls.
-version: 0.2.0-dev.1
+version: 0.2.0
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
