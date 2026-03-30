@@ -452,7 +452,7 @@ class ContextReconstructor:
 
 class Filter:
     class Valves(BaseModel):
-        emit_status_events: int = Field(default=True, description="Toggle whether users should see Context Manager events in OWUI")
+        emit_status_events: bool = Field(default=True, description="Toggle whether users should see Context Manager events in OWUI")
         compression_threshold_tokens: int = Field(
             default=40000,
             description="Trigger archival when the 'Compressible' zone exceeds this token count. Higher values keep more history in full detail but increase costs."
