@@ -3,13 +3,12 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.2
+version: 0.0.3-dev.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 """
-
 import asyncio
 import json
 import logging
@@ -29,7 +28,6 @@ from open_webui.internal.db import get_db_context
 
 try:
     import tiktoken
-
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except ImportError:
     ENCODING = None
@@ -58,7 +56,6 @@ TOOL_RESULT_ATTR_RE = re.compile(r'result="([^"]*)"')
 def _discover_owui_schema() -> Optional[str]:
     try:
         from open_webui.config import DATABASE_SCHEMA
-
         schema = (
             DATABASE_SCHEMA.value
             if hasattr(DATABASE_SCHEMA, "value")
@@ -72,7 +69,6 @@ def _discover_owui_schema() -> Optional[str]:
 _owui_schema = _discover_owui_schema()
 
 if owui_Base is not None and Column is not None:
-
     class ChatManifest(owui_Base):
         __tablename__ = "chat_manifests"
         __table_args__ = (
@@ -90,7 +86,6 @@ if owui_Base is not None and Column is not None:
             default=lambda: datetime.now(timezone.utc),
             onupdate=lambda: datetime.now(timezone.utc),
         )
-
 else:
     ChatManifest = None
 
@@ -297,7 +292,11 @@ class ContextReconstructor:
     ) -> List[Dict[str, Any]]:
         if not messages:
             return messages
-        total_tokens = sum(TokenCounter.count(m) for m in messages)
+        total_tokens = sum(
+            TokenCounter.count(m)
+            for m in messages
+            if not Filter._static_message_has_passthrough_media(m)
+        )
         if total_tokens <= max_tokens:
             return messages
         if keep_last_messages >= len(messages):
@@ -305,9 +304,17 @@ class ContextReconstructor:
         front_messages = (
             messages[:keep_start_messages] if keep_start_messages > 0 else []
         )
-        front_tokens = sum(TokenCounter.count(m) for m in front_messages)
+        front_tokens = sum(
+            TokenCounter.count(m)
+            for m in front_messages
+            if not Filter._static_message_has_passthrough_media(m)
+        )
         tail_messages = messages[-keep_last_messages:] if keep_last_messages > 0 else []
-        tail_tokens = sum(TokenCounter.count(m) for m in tail_messages)
+        tail_tokens = sum(
+            TokenCounter.count(m)
+            for m in tail_messages
+            if not Filter._static_message_has_passthrough_media(m)
+        )
         remaining_budget = max_tokens - front_tokens - tail_tokens
         if remaining_budget <= 0:
             return front_messages + tail_messages
@@ -317,7 +324,11 @@ class ContextReconstructor:
         added = []
         added_tokens = 0
         for msg in middle_messages:
-            msg_tokens = TokenCounter.count(msg)
+            msg_tokens = (
+                0
+                if Filter._static_message_has_passthrough_media(msg)
+                else TokenCounter.count(msg)
+            )
             if added_tokens + msg_tokens <= remaining_budget:
                 added.append(msg)
                 added_tokens += msg_tokens
@@ -447,11 +458,24 @@ class ContextReconstructor:
 
 
 class Filter:
+    @staticmethod
+    def _static_message_has_passthrough_media(message: Dict[str, Any]) -> bool:
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content")
+        media_types = {"image_url", "file", "input_image", "input_file"}
+        if isinstance(content, dict):
+            return str(content.get("type", "")).strip().lower() in media_types
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if str(part.get("type", "")).strip().lower() in media_types:
+                    return True
+        return False
+
     class Valves(BaseModel):
-        emit_status_events: bool = Field(
-            default=True,
-            description="Toggle whether users should see Context Manager events in OWUI",
-        )
+        emit_status_events: bool = Field(default=True, description="Toggle whether users should see Context Manager events in OWUI")
         compression_threshold_tokens: int = Field(
             default=40000,
             description="Trigger archival when the 'Compressible' zone exceeds this token count. Higher values keep more history in full detail but increase costs.",
@@ -542,10 +566,18 @@ class Filter:
                 return None
         return None
 
+    def _message_has_passthrough_media(self, message: Dict[str, Any]) -> bool:
+        return self._static_message_has_passthrough_media(message)
+
     def _message_tokens(self, messages: List[Dict[str, Any]], indices: Set[int]) -> int:
-        return sum(
-            TokenCounter.count(messages[i]) for i in indices if 0 <= i < len(messages)
-        )
+        total = 0
+        for i in indices:
+            if not (0 <= i < len(messages)):
+                continue
+            if self._message_has_passthrough_media(messages[i]):
+                continue
+            total += TokenCounter.count(messages[i])
+        return total
 
     def _content_signature(self, content: Any) -> str:
         if isinstance(content, str):
@@ -713,9 +745,15 @@ class Filter:
         tail_start_idx = max(0, total_msgs - protected_end)
         protected_indices = set(range(start_end_idx))
         protected_indices.update(range(tail_start_idx, total_msgs))
+        media_indices = {
+            i for i, msg in enumerate(messages) if self._message_has_passthrough_media(msg)
+        }
+        protected_indices.update(media_indices)
         summary_indices = set()
         if summary_time is not None:
             for i, msg in enumerate(messages):
+                if i in media_indices:
+                    continue
                 msg_ts = self._timestamp_of(msg)
                 if msg_ts is not None and msg_ts <= summary_time:
                     summary_indices.add(i)
@@ -726,6 +764,7 @@ class Filter:
             set(range(compressible_start, compressible_end))
             - summary_indices
             - protected_indices
+            - media_indices
         )
         return MessagePools(
             total_msgs=total_msgs,
@@ -826,7 +865,20 @@ class Filter:
     ) -> bool:
         msg_ts = self._timestamp_of(message)
         if msg_ts is None:
-            return False
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = str(part.get("type", "")).strip().lower()
+                    if part_type in {"image_url", "file", "input_image", "input_file"}:
+                        return True
+            elif isinstance(content, dict):
+                part_type = str(content.get("type", "")).strip().lower()
+                if part_type in {"image_url", "file", "input_image", "input_file"}:
+                    return True
+            # Messages without timestamps are typically current in-flight request messages.
+            return True
         return msg_ts > timestamp
 
     def _trim_message_content(
@@ -855,7 +907,11 @@ class Filter:
             return False
         if mode == "always":
             return True
-        projected_tokens = TokenCounter.count(messages)
+        projected_tokens = sum(
+            TokenCounter.count(m)
+            for m in messages
+            if not self._message_has_passthrough_media(m)
+        )
         if summary_state.raw:
             pools = self._split_message_pools(
                 messages,
@@ -894,6 +950,10 @@ class Filter:
         target_indices, trim_protected = self._build_inlet_trim_targets(
             db_messages, summary_state, pools
         )
+        target_indices = {
+            i for i in target_indices
+            if 0 <= i < len(db_messages) and not self._message_has_passthrough_media(db_messages[i])
+        }
         trimmed_messages, trim_stats = self.reconstructor.trim_tool_content(
             db_messages,
             self.valves.tool_trim_threshold,
@@ -908,19 +968,13 @@ class Filter:
             active_messages = [summary_msg]
             if summary_state.until_ts is not None:
                 for msg in trimmed_messages:
-                    if self._is_message_after_timestamp(msg, summary_state.until_ts):
+                    if self._message_has_passthrough_media(msg) or self._is_message_after_timestamp(msg, summary_state.until_ts):
                         active_messages.append(msg)
             else:
                 active_messages.extend(trimmed_messages)
         else:
             active_messages = trimmed_messages
         active_messages = self._normalize_messages(active_messages)
-        active_messages = self.reconstructor.safe_hard_limit(
-            active_messages,
-            self.valves.max_context_tokens,
-            keep_start_messages=self.valves.keep_start_messages,
-            keep_last_messages=self.valves.keep_last_messages,
-        )
         return active_messages, trim_stats
 
     def _compression_metrics(
@@ -977,7 +1031,9 @@ class Filter:
             self.valves.keep_last_messages,
         )
         working_compressible = [
-            messages_working[i] for i in sorted(working_pools.compressible_indices)
+            messages_working[i]
+            for i in sorted(working_pools.compressible_indices)
+            if not self._message_has_passthrough_media(messages_working[i])
         ]
         active_source_messages = self._build_active_request_messages(chat_id, body)
         return {
@@ -1308,7 +1364,11 @@ Provide ONLY the updated archive text. No conversational filler, no markdown blo
                         emitter, "⚠️ Summary generated but save failed"
                     )
                     return
-                pool_tokens = sum(TokenCounter.count(m) for m in compressible)
+                pool_tokens = sum(
+                    TokenCounter.count(m)
+                    for m in compressible
+                    if not self._message_has_passthrough_media(m)
+                )
                 summary_tokens = TokenCounter.count(new_summary_content)
                 efficiency = None
                 if pool_tokens > 0:
