@@ -1,1249 +1,1387 @@
 """
-title: Dynamic Media Manager
-id: dynamic_media_manager
-description: Automatically manages large media (images, videos) in messages to prevent 413 Request Entity Too Large errors. Supports compression, size thresholds, quality gradients, vision model detection, and smart image dropping with OCR/VLM descriptions.
+title: Context Manager
+id: context_manager
 author: jndao
+description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
+version: 0.0.3-dev.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
-version: 0.2.2
+funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
-
-Overview:
-  Compresses images in chat messages to prevent 413 errors. Applies quality gradient
-  (recent images = higher quality, older = lower). Supports PNG→JPEG conversion, vision
-  model detection, and OCR-based image descriptions for non-vision models.
-
-Configuration:
-  priority: 15 (runs after context compression at 10)
-  max_image_size_bytes: 1048576 (1MB) - images above this are compressed
-  max_payload_size_bytes: 10485760 (10MB) - oldest images dropped if exceeded
-  enable_quality_gradient: true - recent images get higher quality
-  recent_image_quality: 85 (0-100)
-  old_image_quality: 40 (0-100)
-  convert_png_to_jpeg: true - better compression
-  preserve_transparency: true - transparent PNGs → WebP
-  enable_status_notifications: true - show compression status
-  debug_mode: false
-  enable_vision_detection: true - check model vision capabilities
-  drop_images_for_non_vision: true - drop images for non-vision models
-  enable_smart_drop: true - generate OCR descriptions for dropped images
-  description_quality: medium (low/medium/high)
-  use_ocr: true - extract text via RapidOCR
-
-Requirements: Pillow (PIL) - typically included in Open WebUI
 """
-
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List, Tuple, Callable
-import base64
-import io
-import logging
 import asyncio
-import re
 import json
+import logging
+import re
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Callable, Set, Tuple
 
-# Setup logger
+from fastapi.requests import Request
+from pydantic import BaseModel, Field
+
+from open_webui.models.users import Users
+from open_webui.utils.chat import generate_chat_completion
+from open_webui.models.chats import Chats
+from open_webui.internal.db import get_db_context
+
+try:
+    import tiktoken
+    ENCODING = tiktoken.get_encoding("cl100k_base")
+except ImportError:
+    ENCODING = None
+
+try:
+    from open_webui.internal.db import Base as owui_Base
+except ImportError:
+    owui_Base = None
+
+try:
+    from sqlalchemy import Column, Integer, String, Text, DateTime
+except ImportError:
+    Column = None
+    Integer = None
+    String = None
+    Text = None
+    DateTime = None
+
 logger = logging.getLogger(__name__)
-
-# Try to import Pillow for image processing
-try:
-    from PIL import Image
-    PILLOW_AVAILABLE = True
-except ImportError:
-    PILLOW_AVAILABLE = False
-    logger.warning("[Image Compressor] Pillow not installed. Image compression will be disabled.")
+SUMMARY_TAG = "context_summary"
+SUMMARY_SOURCE = "context_manager"
+TOOL_DETAILS_BLOCK_RE = re.compile(r'<details type="tool_calls"[\s\S]*?</details>')
+TOOL_RESULT_ATTR_RE = re.compile(r'result="([^"]*)"')
 
 
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
-# Base64 encoded image prefixes for format detection
-IMAGE_PREFIXES = {
-    b"/9j/": "jpeg",  # JPEG
-    b"iVBORw0KGgo": "png",  # PNG
-    b"R0lGOD": "gif",  # GIF
-    b"UklGR": "webp",  # WebP
-    b"Qk0": "bmp",  # BMP
-}
-
-# MIME types for image formats
-MIME_TYPES = {
-    "jpeg": "image/jpeg",
-    "jpg": "image/jpeg",
-    "png": "image/png",
-    "gif": "image/gif",
-    "webp": "image/webp",
-    "bmp": "image/bmp",
-}
-
-# Format extensions
-FORMAT_EXTENSIONS = {
-    "jpeg": ".jpg",
-    "jpg": ".jpg",
-    "png": ".png",
-    "gif": ".gif",
-    "webp": ".webp",
-    "bmp": ".bmp",
-}
-
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def detect_image_format(base64_data: str) -> Optional[str]:
-    """Detect image format from base64 data prefix."""
-    # Remove data URL prefix if present
-    if "base64," in base64_data:
-        base64_data = base64_data.split("base64,")[1]
-    
-    # Try to detect format from first bytes
+def _discover_owui_schema() -> Optional[str]:
     try:
-        # Decode just enough to check the prefix
-        sample = base64.b64decode(base64_data[:32])
-        
-        for prefix, fmt in IMAGE_PREFIXES.items():
-            if sample.startswith(prefix):
-                return fmt
+        from open_webui.config import DATABASE_SCHEMA
+        schema = (
+            DATABASE_SCHEMA.value
+            if hasattr(DATABASE_SCHEMA, "value")
+            else DATABASE_SCHEMA
+        )
+        return schema if schema else None
     except Exception:
-        pass
-    
-    return None
-
-
-def extract_base64_data(image_url: str) -> Tuple[Optional[str], Optional[str], str]:
-    """
-    Extract base64 data from various image URL formats.
-    
-    Returns:
-        Tuple of (base64_data, detected_format, original_url)
-    """
-    if not image_url:
-        return None, None, image_url
-    
-    # Handle data URL format: data:image/png;base64,iVBORw0KGgo...
-    if image_url.startswith("data:image/"):
-        match = re.match(r"data:image/([^;]+);base64,(.+)", image_url)
-        if match:
-            mime_type = match.group(1).lower()
-            base64_data = match.group(2)
-            # Normalize mime type
-            fmt = mime_type.replace("jpg", "jpeg")
-            return base64_data, fmt, image_url
-    
-    # Handle raw base64 (no prefix)
-    if re.match(r'^[A-Za-z0-9+/=]+$', image_url.strip()):
-        fmt = detect_image_format(image_url)
-        return image_url.strip(), fmt, image_url
-    
-    # Not a base64 image (probably a URL)
-    return None, None, image_url
-
-
-def calculate_base64_size(base64_data: str) -> int:
-    """Calculate the approximate byte size of base64-encoded data."""
-    # Remove any whitespace and padding
-    clean_data = base64_data.replace("\n", "").replace("\r", "").strip()
-    # Base64 encodes 3 bytes into 4 characters
-    # Account for padding
-    padding = clean_data.count("=")
-    return (len(clean_data) * 3) // 4 - padding
-
-
-def format_size(size_bytes: int) -> str:
-    """Format byte size as human-readable string."""
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f}{unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f}TB"
-
-
-def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
-    """
-    Check if a model supports vision capabilities.
-    
-    Checks Explicit capabilities in model["info"]["meta"]["capabilities"]["vision"]
-    
-    Args:
-        model: The model dictionary from __model__ parameter
-        
-    Returns:
-        True if model supports vision, False otherwise
-    """
-    if not model:
-        # No model info - assume supports vision to be safe
-        return True
-    
-    # Check explicit capabilities (from Open WebUI model settings)
-    capabilities = model.get("info", {}).get("meta", {}).get("capabilities", {})
-    if capabilities is not None:
-        # If explicitly set, use that value
-        if "vision" in capabilities:
-            return bool(capabilities["vision"])
-    
-    # Default to True if we can't determine - safer to keep images
-    return True
-
-
-# Try to import RapidOCR for OCR (already included in Open WebUI dependencies)
-try:
-    from rapidocr_onnxruntime import RapidOCR
-    RAPIDOCR_AVAILABLE = True
-    # Create global OCR engine
-    _ocr_engine = RapidOCR()
-except ImportError:
-    RAPIDOCR_AVAILABLE = False
-    _ocr_engine = None
-    logger.warning("[Dynamic Media Manager] rapidocr-onnxruntime not installed. OCR will be disabled.")
-    
-
-def extract_text_from_image(base64_data: str, debug: bool = False) -> Optional[str]:
-    """
-    Extract text from an image using RapidOCR.
-    
-    Args:
-        base64_data: Base64-encoded image data
-        debug: Enable debug logging
-        
-    Returns:
-        Extracted text or None if extraction failed
-    """
-    if not RAPIDOCR_AVAILABLE or _ocr_engine is None:
-        if debug:
-            logger.info("[Dynamic Media Manager] RapidOCR not available for OCR")
         return None
-    
-    try:
-        # Decode base64 to image bytes
-        image_bytes = base64.b64decode(base64_data)
-        
-        # Run OCR
-        result, elapsed = _ocr_engine(image_bytes)
-        
-        if result is None or len(result) == 0:
+
+
+_owui_schema = _discover_owui_schema()
+
+if owui_Base is not None and Column is not None:
+    class ChatManifest(owui_Base):
+        __tablename__ = "chat_manifests"
+        __table_args__ = (
+            {"extend_existing": True, "schema": _owui_schema}
+            if _owui_schema
+            else {"extend_existing": True}
+        )
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        chat_id = Column(String(255), unique=True, nullable=False)
+        summary_content = Column(Text, nullable=False)
+        until_timestamp = Column(Integer, nullable=True)
+        created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+        updated_at = Column(
+            DateTime,
+            default=lambda: datetime.now(timezone.utc),
+            onupdate=lambda: datetime.now(timezone.utc),
+        )
+else:
+    ChatManifest = None
+
+
+@dataclass
+class SummaryState:
+    content: str
+    until_ts: Optional[int]
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class MessagePools:
+    total_msgs: int
+    protected_start: int
+    protected_end: int
+    tail_start_idx: int
+    start_end_idx: int
+    summary_indices: Set[int]
+    protected_indices: Set[int]
+    compressible_indices: Set[int]
+
+
+class SummaryStore:
+    def __init__(self):
+        self._initialized = False
+        self._init_error = None
+
+    def _ensure_table(self):
+        if self._initialized:
+            return self._init_error is None
+        self._initialized = True
+        try:
+            if ChatManifest is None:
+                raise RuntimeError("Database table dependencies are unavailable")
+            with get_db_context() as db:
+                ChatManifest.__table__.create(bind=db.bind, checkfirst=True)
+                db.commit()
+            return True
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                return True
+            self._init_error = str(e)
+            logger.error(f"[SummaryStore] Failed to ensure table: {e}")
+            return False
+
+    def get(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        if not self._ensure_table():
             return None
-        
-        # Extract all text from OCR results
-        text_lines = []
-        for line in result:
-            # result format: [box, text, confidence]
-            if len(line) >= 2 and line[1]:
-                text_lines.append(line[1])
-        
-        text = " ".join(text_lines).strip()
-        
-        if text and debug:
-            logger.info(f"[Dynamic Media Manager] RapidOCR extracted {len(text)} characters in {elapsed:.2f}s")
-        
-        return text if text else None
-    except Exception as e:
-        if debug:
-            logger.info(f"[Dynamic Media Manager] RapidOCR failed: {e}")
-        return None
-
-
-def generate_smart_image_description(
-    base64_data: str,
-    use_ocr: bool = True,
-    debug: bool = False,
-) -> str:
-    """
-    Generate a smart description of an image using OCR and/or VLM.
-    
-    Args:
-        base64_data: Base64-encoded image data
-        quality: Description quality (low, medium, high)
-        use_ocr: Whether to use OCR
-        model_info: Model information for VLM
-        debug: Enable debug logging
-        
-    Returns:
-        Generated description or fallback text
-    """
-    description_parts = []
-    
-    # Try OCR first (fast, no API needed)
-    if use_ocr and RAPIDOCR_AVAILABLE:
-        ocr_text = extract_text_from_image(base64_data, debug)
-        if ocr_text:
-            description_parts.append(f"[OCR Text]: {ocr_text}")
-            if debug:
-                logger.info(f"[Dynamic Media Manager] OCR found text: {ocr_text[:100]}...")
-    
-    if description_parts:
-        return " ".join(description_parts)
-    
-    # Fallback
-    return "[Image content not available - could not extract description]"
-
-
-# =============================================================================
-# IMAGE COMPRESSOR CLASS
-# =============================================================================
-
-class ImageCompressor:
-    """Handles image compression operations - simplified version."""
-    
-    def __init__(
-        self,
-        max_size_bytes: int = 1 * 1024 * 1024,  # 1MB default
-        convert_png_to_jpeg: bool = True,
-        preserve_transparency: bool = True,
-        debug: bool = False,
-    ):
-        self.max_size_bytes = max_size_bytes
-        self.convert_png_to_jpeg = convert_png_to_jpeg
-        self.preserve_transparency = preserve_transparency
-        self.debug = debug
-    
-    def _log(self, message: str):
-        """Log debug message."""
-        if self.debug:
-            logger.info(f"[Image Compressor] {message}")
-    
-    def compress_image(
-        self,
-        base64_data: str,
-        original_format: Optional[str] = None,
-        quality: int = 85,
-    ) -> Tuple[str, str, Dict[str, Any]]:
-        """
-        Compress a base64-encoded image at the specified quality.
-        
-        Args:
-            base64_data: Base64-encoded image data
-            original_format: Detected or specified format (jpeg, png, etc.)
-            quality: Compression quality (1-100)
-        
-        Returns:
-            Tuple of (compressed_base64, new_format, stats_dict)
-        """
-        if not PILLOW_AVAILABLE:
-            raise RuntimeError("Pillow is not installed. Cannot compress images.")
-        
-        # Decode base64 to image
         try:
-            image_bytes = base64.b64decode(base64_data)
+            with get_db_context() as db:
+                record = db.query(ChatManifest).filter_by(chat_id=chat_id).first()
+                if record:
+                    return {
+                        "content": record.summary_content,
+                        "until_timestamp": record.until_timestamp,
+                        "updated_at": record.updated_at,
+                    }
+                return None
         except Exception as e:
-            raise ValueError(f"Failed to decode base64 data: {e}")
-        
-        original_size = len(image_bytes)
-        
-        # Open image with Pillow
+            logger.error(f"[SummaryStore] Failed to get summary: {e}")
+            return None
+
+    def save(
+        self, chat_id: str, content: str, until_timestamp: Optional[int] = None
+    ) -> bool:
+        if not self._ensure_table():
+            return False
         try:
-            image = Image.open(io.BytesIO(image_bytes))
-        except Exception as e:
-            raise ValueError(f"Failed to open image: {e}")
-        
-        # Detect format if not provided
-        if not original_format:
-            original_format = image.format.lower() if image.format else "png"
-        
-        original_mode = image.mode
-        original_dimensions = image.size
-        has_transparency = image.mode in ("RGBA", "LA", "P")
-        
-        self._log(
-            f"Original: {original_format.upper()}, {original_dimensions[0]}x{original_dimensions[1]}, "
-            f"{format_size(original_size)}, mode={original_mode}"
-        )
-        
-        # Determine target format
-        target_format = self._determine_target_format(
-            original_format, has_transparency, original_size
-        )
-        
-        # Prepare image for saving (no resizing - just format/mode conversion)
-        processed_image = self._prepare_image_for_save(image, target_format)
-        
-        # Single-pass compression at specified quality
-        compressed_data = self._compress_at_quality(processed_image, target_format, quality)
-        final_quality = quality
-        
-        # Build stats
-        stats = {
-            "original_size": original_size,
-            "compressed_size": len(compressed_data),
-            "original_format": original_format,
-            "new_format": target_format,
-            "original_dimensions": original_dimensions,
-            "new_dimensions": processed_image.size,
-            "original_mode": original_mode,
-            "new_mode": processed_image.mode,
-            "quality": final_quality,
-            "compression_ratio": len(compressed_data) / original_size if original_size > 0 else 1.0,
-        }
-        
-        self._log(
-            f"Compressed: {target_format.upper()}, {processed_image.size[0]}x{processed_image.size[1]}, "
-            f"{format_size(len(compressed_data))}, quality={final_quality}, "
-            f"ratio={stats['compression_ratio']:.2%}"
-        )
-        
-        # Encode back to base64
-        compressed_base64 = base64.b64encode(compressed_data).decode("utf-8")
-        
-        return compressed_base64, target_format, stats
-    
-    def _determine_target_format(
-        self,
-        original_format: str,
-        has_transparency: bool,
-        original_size: int,
-    ) -> str:
-        """Determine the best target format for compression."""
-        # If already JPEG, keep JPEG
-        if original_format in ("jpeg", "jpg"):
-            return "jpeg"
-        
-        # If WebP, keep WebP (already efficient)
-        if original_format == "webp":
-            return "webp"
-        
-        # If GIF with animation, keep as GIF (we don't handle animation)
-        if original_format == "gif":
-            return "gif"
-        
-        # For PNG and other formats
-        if self.convert_png_to_jpeg:
-            if has_transparency and self.preserve_transparency:
-                # Use WebP to preserve transparency with better compression
-                return "webp"
-            else:
-                # Convert to JPEG for better compression
-                return "jpeg"
-        
-        # Keep original format
-        return original_format
-    
-    def _prepare_image_for_save(self, image: Image.Image, target_format: str) -> Image.Image:
-        """Prepare image for saving in target format (no resizing - just format conversion)."""
-        # Convert mode for target format
-        if target_format == "jpeg":
-            # JPEG doesn't support transparency
-            if image.mode in ("RGBA", "LA", "P"):
-                # Create white background for transparent images
-                background = Image.new("RGB", image.size, (255, 255, 255))
-                if image.mode == "P":
-                    image = image.convert("RGBA")
-                if image.mode in ("RGBA", "LA"):
-                    background.paste(image, mask=image.split()[-1])
-                    image = background
+            with get_db_context() as db:
+                record = db.query(ChatManifest).filter_by(chat_id=chat_id).first()
+                if record:
+                    record.summary_content = content
+                    record.until_timestamp = until_timestamp
+                    record.updated_at = datetime.now(timezone.utc)
                 else:
-                    image = image.convert("RGB")
-            elif image.mode != "RGB":
-                image = image.convert("RGB")
-        
-        elif target_format == "webp":
-            # WebP supports both RGB and RGBA
-            if image.mode == "P":
-                image = image.convert("RGBA" if image.info.get("transparency") else "RGB")
-            elif image.mode not in ("RGB", "RGBA", "L"):
-                image = image.convert("RGB")
-        
-        return image
-    
-    def _compress_at_quality(
-        self,
-        image: Image.Image,
-        target_format: str,
-        quality: int,
-    ) -> bytes:
-        """
-        Compress image at the specified quality level.
-        
-        Args:
-            image: PIL Image object
-            target_format: Target format (jpeg, webp, png, gif)
-            quality: Compression quality (1-100)
-        
-        Returns:
-            Compressed image bytes
-        """
-        buffer = io.BytesIO()
-        
-        save_kwargs = {}
-        if target_format == "jpeg":
-            save_kwargs = {"quality": quality, "optimize": True}
-        elif target_format == "webp":
-            save_kwargs = {"quality": quality, "method": 4}
-        elif target_format == "png":
-            save_kwargs = {"optimize": True}
-        elif target_format == "gif":
-            save_kwargs = {"optimize": True}
-        
-        try:
-            image.save(buffer, format=target_format.upper(), **save_kwargs)
-            return buffer.getvalue()
+                    record = ChatManifest(
+                        chat_id=chat_id,
+                        summary_content=content,
+                        until_timestamp=until_timestamp,
+                    )
+                    db.add(record)
+                db.commit()
         except Exception as e:
-            self._log(f"Failed to compress at quality {quality}: {e}")
-            raise
+            logger.error(f"[SummaryStore] Failed to save summary: {e}")
+            return False
+        return True
+
+    def delete(self, chat_id: str) -> bool:
+        if not self._ensure_table():
+            return False
+        try:
+            with get_db_context() as db:
+                db.query(ChatManifest).filter_by(chat_id=chat_id).delete()
+                db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[SummaryStore] Failed to delete summary: {e}")
+            return False
 
 
-# =============================================================================
-# FILTER CLASS
-# =============================================================================
+_summary_store: Optional[SummaryStore] = None
+
+
+def _get_store() -> Optional[SummaryStore]:
+    global _summary_store
+    if _summary_store is None:
+        _summary_store = SummaryStore()
+    return _summary_store
+
+
+def get_summary_from_store(chat_id: str) -> Optional[Dict[str, Any]]:
+    store = _get_store()
+    if store is None:
+        return None
+    return store.get(chat_id)
+
+
+class TokenCounter:
+    @staticmethod
+    def count(item: Any) -> int:
+        if isinstance(item, str):
+            return TokenCounter._count_text(item)
+        if isinstance(item, dict):
+            return TokenCounter._count_message(item)
+        if isinstance(item, list):
+            return sum(TokenCounter.count(m) for m in item)
+        return 0
+
+    @staticmethod
+    def _count_text(text: str) -> int:
+        if ENCODING:
+            try:
+                return len(ENCODING.encode(text))
+            except Exception:
+                pass
+        return max(1, len(text) // 4)
+
+    @staticmethod
+    def _count_message(msg: Dict[str, Any]) -> int:
+        total = 0
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            total += TokenCounter._count_text(content)
+        elif isinstance(content, dict):
+            total += TokenCounter._count_text(TokenCounter.extract_text(content))
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        total += TokenCounter._count_text(part.get("text", ""))
+                    else:
+                        continue
+                elif isinstance(part, str):
+                    total += TokenCounter._count_text(part)
+
+        total += 4
+        return total
+
+    @staticmethod
+    def extract_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, dict):
+            content_type = str(content.get("type", "")).strip().lower()
+            if content_type in {"text", "input_text"}:
+                text_value = content.get("text")
+                if isinstance(text_value, str):
+                    return text_value
+                nested_content = content.get("content")
+                if isinstance(nested_content, str):
+                    return nested_content
+            return ""
+
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = str(part.get("type", "")).strip().lower()
+                    if part_type in {"text", "input_text"}:
+                        text_value = part.get("text")
+                        if isinstance(text_value, str) and text_value:
+                            texts.append(text_value)
+                            continue
+                        nested_content = part.get("content")
+                        if isinstance(nested_content, str) and nested_content:
+                            texts.append(nested_content)
+                elif isinstance(part, str):
+                    texts.append(part)
+            return " ".join(t for t in texts if t)
+
+        return ""
+
+
+class ContextReconstructor:
+    @staticmethod
+    def trim_messages(
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+        keep_start_messages: int = 0,
+        keep_last_messages: int = 4,
+    ) -> List[Dict[str, Any]]:
+        if not messages:
+            return messages
+        total_tokens = sum(
+            TokenCounter.count(m)
+            for m in messages
+            if not Filter._static_message_has_passthrough_media(m)
+        )
+        if total_tokens <= max_tokens:
+            return messages
+        if keep_last_messages >= len(messages):
+            return messages
+        front_messages = (
+            messages[:keep_start_messages] if keep_start_messages > 0 else []
+        )
+        front_tokens = sum(
+            TokenCounter.count(m)
+            for m in front_messages
+            if not Filter._static_message_has_passthrough_media(m)
+        )
+        tail_messages = messages[-keep_last_messages:] if keep_last_messages > 0 else []
+        tail_tokens = sum(
+            TokenCounter.count(m)
+            for m in tail_messages
+            if not Filter._static_message_has_passthrough_media(m)
+        )
+        remaining_budget = max_tokens - front_tokens - tail_tokens
+        if remaining_budget <= 0:
+            return front_messages + tail_messages
+        middle_messages = messages[
+            keep_start_messages : len(messages) - keep_last_messages
+        ]
+        added = []
+        added_tokens = 0
+        for msg in middle_messages:
+            msg_tokens = (
+                0
+                if Filter._static_message_has_passthrough_media(msg)
+                else TokenCounter.count(msg)
+            )
+            if added_tokens + msg_tokens <= remaining_budget:
+                added.append(msg)
+                added_tokens += msg_tokens
+            else:
+                break
+        return front_messages + added + tail_messages
+
+    def safe_hard_limit(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+        keep_start_messages: int = 0,
+        keep_last_messages: int = 4,
+    ) -> List[Dict[str, Any]]:
+        return self.trim_messages(
+            messages,
+            max_tokens,
+            keep_start_messages=keep_start_messages,
+            keep_last_messages=keep_last_messages,
+        )
+
+    @staticmethod
+    def collapsed_tool_text() -> str:
+        return "[TOOL OUTPUT COLLAPSED]"
+
+    @staticmethod
+    def _shorten_tool_call_id(value: str, max_len: int = 64) -> str:
+        if not isinstance(value, str):
+            return value
+        raw = value.strip()
+        if len(raw) <= max_len:
+            return raw
+        prefix_len = max(16, max_len // 2)
+        suffix_len = max(8, max_len - prefix_len - 3)
+        if prefix_len + suffix_len + 3 > max_len:
+            suffix_len = max(4, max_len - prefix_len - 3)
+        return f"{raw[:prefix_len]}...{raw[-suffix_len:]}"
+
+    def normalize_tool_call_ids(self, messages: List[Dict[str, Any]]) -> int:
+        rewritten_ids: Dict[str, str] = {}
+        for message in messages:
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                original_id = tool_call.get("id")
+                if not isinstance(original_id, str) or not original_id.strip():
+                    continue
+                if len(original_id.strip()) <= 64:
+                    continue
+                normalized_id = rewritten_ids.get(original_id)
+                if normalized_id is None:
+                    normalized_id = self._shorten_tool_call_id(original_id)
+                    rewritten_ids[original_id] = normalized_id
+                tool_call["id"] = normalized_id
+        if not rewritten_ids:
+            return 0
+        for message in messages:
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str):
+                continue
+            normalized_id = rewritten_ids.get(tool_call_id)
+            if normalized_id and normalized_id != tool_call_id:
+                message["tool_call_id"] = normalized_id
+        return sum(1 for old_id, new_id in rewritten_ids.items() if old_id != new_id)
+
+    def trim_tool_content(
+        self,
+        messages: List[Dict[str, Any]],
+        threshold: int,
+        target_indices: Optional[Set[int]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        trimmed: List[Dict[str, Any]] = [deepcopy(msg) for msg in messages]
+        stats = {
+            "trimmed_count": 0,
+            "chars_removed": 0,
+            "tool_messages_trimmed": 0,
+            "detail_blocks_trimmed": 0,
+            "tool_call_ids_normalized": 0,
+        }
+        stats["tool_call_ids_normalized"] = self.normalize_tool_call_ids(trimmed)
+        collapsed_text = self.collapsed_tool_text()
+        for i, msg_copy in enumerate(trimmed):
+            if target_indices is not None and i not in target_indices:
+                continue
+            role = msg_copy.get("role")
+            if role == "tool":
+                content = msg_copy.get("content")
+                content_text = TokenCounter.extract_text(content)
+                if content_text and len(content_text) > threshold:
+                    removed = max(0, len(content_text) - len(collapsed_text))
+                    msg_copy["content"] = collapsed_text
+                    stats["trimmed_count"] += 1
+                    stats["tool_messages_trimmed"] += 1
+                    stats["chars_removed"] += removed
+            content = msg_copy.get("content")
+            if (
+                not isinstance(content, str)
+                or '<details type="tool_calls"' not in content
+            ):
+                continue
+
+            def _replace_tool_result(match: re.Match) -> str:
+                block = match.group(0)
+                result_match = TOOL_RESULT_ATTR_RE.search(block)
+                if not result_match:
+                    return block
+                result_payload = result_match.group(1)
+                if len(result_payload) <= threshold:
+                    return block
+                removed = max(0, len(result_payload) - len(collapsed_text))
+                stats["trimmed_count"] += 1
+                stats["detail_blocks_trimmed"] += 1
+                stats["chars_removed"] += removed
+                return TOOL_RESULT_ATTR_RE.sub(
+                    f'result="{collapsed_text}"',
+                    block,
+                    count=1,
+                )
+
+            msg_copy["content"] = TOOL_DETAILS_BLOCK_RE.sub(
+                _replace_tool_result, content
+            )
+        return trimmed, stats
+
 
 class Filter:
-    """Open WebUI Filter for dynamic image compression."""
-    
+    @staticmethod
+    def _static_message_has_passthrough_media(message: Dict[str, Any]) -> bool:
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content")
+        media_types = {"image_url", "file", "input_image", "input_file"}
+        if isinstance(content, dict):
+            return str(content.get("type", "")).strip().lower() in media_types
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if str(part.get("type", "")).strip().lower() in media_types:
+                    return True
+        return False
+
+    class Valves(BaseModel):
+        emit_status_events: bool = Field(default=True, description="Toggle whether users should see Context Manager events in OWUI")
+        compression_threshold_tokens: int = Field(
+            default=40000,
+            description="Trigger archival when the 'Compressible' zone exceeds this token count. Higher values keep more history in full detail but increase costs.",
+        )
+        max_context_tokens: int = Field(
+            default=120000,
+            description="The hard limit for the model's total context window. If exceeded, the filter will intelligently trim tool outputs to ensure the model can still respond.",
+        )
+        keep_start_messages: int = Field(
+            default=0,
+            description="Number of messages at the very beginning of the chat to protect from summarization (useful for persistent system-like instructions or 'rules of the road').",
+        )
+        keep_last_messages: int = Field(
+            default=10,
+            description="Number of recent messages to keep in the 'Protected' zone. These are never summarized, ensuring high-fidelity short-term memory for the current conversation.",
+        )
+        summary_model: Optional[str] = Field(
+            default=None,
+            description="The Model ID to use for background summarization. Recommended: A fast, cheap, but intelligent model to save costs.",
+        )
+        include_protected_in_threshold: bool = Field(
+            default=True,
+            description="If true, Protected messages count toward the compression threshold. If false, only 'Compressible' messages are measured against the threshold.",
+        )
+        tool_trim_threshold: int = Field(
+            default=1000,
+            description="Tool outputs or <details> blocks larger than this token count are eligible for Smart Trimming when context pressure is high.",
+        )
+        protected_tool_trim_mode: str = Field(
+            default="never",
+            description="Controls tool trimming in the Protected zone. 'never': Keep all tool data; 'overflow_only': Trim only if context exceeds max_context_tokens; 'always': Always trim large tools.",
+        )
+        debug_logging: bool = Field(
+            default=False,
+            description="Enable detailed console logging for troubleshooting token accounting and background compression tasks.",
+        )
+
     def __init__(self):
         self.valves = self.Valves()
-    
-    class Valves(BaseModel):
-        """Configuration valves for the filter."""
-        
-        priority: int = Field(
-            default=15,
-            description="Filter priority. Set HIGHER than context compression (10) to process the final message list after context compression has assembled it.",
-        )
-        
-        max_image_size_bytes: int = Field(
-            default=1 * 1024 * 1024,  # 1MB
-            ge=1024,
-            description="Maximum image size in bytes. Images larger than this will be compressed. Default: 1MB",
-        )
-        
-        max_payload_size_bytes: int = Field(
-            default=10 * 1024 * 1024,  # 10MB
-            ge=1024,
-            description="Maximum total payload size in bytes. If exceeded after compression, oldest images will be dropped. Default: 10MB",
-        )
-        
-        enable_quality_gradient: bool = Field(
-            default=True,
-            description="Enable quality gradient - recent images get higher quality, older images get more compression.",
-        )
-        
-        recent_image_quality: int = Field(
-            default=85,
-            ge=1,
-            le=100,
-            description="Compression quality for the most recent images (0-100). Higher = better quality, larger files.",
-        )
-        
-        old_image_quality: int = Field(
-            default=40,
-            ge=1,
-            le=100,
-            description="Compression quality for the oldest images (0-100). Lower = more compression, smaller files.",
-        )
-        
-        convert_png_to_jpeg: bool = Field(
-            default=True,
-            description="Convert PNG images to JPEG for better compression.",
-        )
-        
-        preserve_transparency: bool = Field(
-            default=True,
-            description="When enabled, transparent PNGs will be converted to WebP instead of JPEG to preserve transparency.",
-        )
-        
-        enable_status_notifications: bool = Field(
-            default=True,
-            description="Show status notifications when images are compressed.",
-        )
-        
-        debug_mode: bool = Field(
-            default=False,
-            description="Enable detailed debug logging.",
-        )
-        
-        enable_vision_detection: bool = Field(
-            default=True,
-            description="Enable detection of vision capabilities. When enabled, the filter will check if the model supports vision and can optionally drop images for non-vision models.",
-        )
-        
-        drop_images_for_non_vision: bool = Field(
-            default=True,
-            description="If the model doesn't support vision and this is enabled, all images will be dropped and replaced with a text placeholder. Requires enable_vision_detection to be true.",
-        )
-        
-        enable_smart_drop: bool = Field(
-            default=True,
-            description="When dropping images for non-vision models, attempt to generate text descriptions (OCR) instead of just placeholder text.",
-        )
-        
-        description_quality: str = Field(
-            default="medium",
-            description="Quality of image descriptions. Options: low (brief), medium (standard), high (detailed). Higher quality takes longer to generate.",
-        )
-        
-        use_ocr: bool = Field(
-            default=True,
-            description="Use OCR to extract text from images when generating descriptions. Uses RapidOCR (included in Open WebUI dependencies).",
-        )
-    
-    def _log(self, message: str, level: str = "info"):
-        """Log message with appropriate level."""
-        if level == "debug" and not self.valves.debug_mode:
-            return
-        
-        log_func = getattr(logger, level, logger.info)
-        log_func(f"[Dynamic Image Compressor] {message}")
-    
+        self.reconstructor = ContextReconstructor()
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, chat_id: str) -> asyncio.Lock:
+        if chat_id not in self._locks:
+            self._locks[chat_id] = asyncio.Lock()
+        return self._locks[chat_id]
+
     async def _emit_status(
-        self,
-        message: str,
-        event_emitter,
-        done: bool = True,
+        self, emitter: Optional[Callable], message: str, done: bool = True
     ):
-        """Emit status notification to frontend."""
-        if not self.valves.enable_status_notifications or not event_emitter:
+        if emitter is None or not self.valves.emit_status_events:
             return
-        
         try:
-            await event_emitter({
-                "type": "status",
-                "data": {
-                    "description": message,
-                    "done": done,
-                },
-            })
-        except Exception as e:
-            self._log(f"Failed to emit status: {e}", level="warning")
-    
-    async def _emit_debug_log(
-        self,
-        message: str,
-        event_call,
-    ):
-        """Emit debug log to browser console."""
-        if not self.valves.debug_mode or not event_call:
-            return
-        
-        try:
-            js_code = f"""
-                try {{
-                    console.log("%c[Image Compressor] {message}", "color: #8b5cf6;");
-                    return true;
-                }} catch (e) {{
-                    return false;
-                }}
-            """
-            await asyncio.wait_for(
-                event_call({"type": "execute", "data": {"code": js_code}}),
-                timeout=2.0,
+            await emitter(
+                {"type": "status", "data": {"description": message, "done": done}}
             )
         except Exception as e:
-            self._log(f"Failed to emit debug log: {e}", level="debug")
-    
-    def _count_images_in_content(self, content: Any) -> int:
-        """Count images in message content for debugging."""
-        count = 0
-        
-        if isinstance(content, str):
-            # Check for embedded base64 images in markdown
-            if "data:image/" in content:
-                count += content.count("data:image/")
-            return count
-        
-        if isinstance(content, dict):
-            if content.get("type") == "image_url":
-                return 1
-            return 0
-        
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    count += 1
-            return count
-        
-        return 0
-    
-    def _process_image_in_message(
-        self,
-        content: Any,
-        compressor: ImageCompressor,
-        quality: Optional[int | Callable[[int], int]] = None,
-    ) -> Tuple[Any, List[Dict[str, Any]]]:
-        """
-        Process images in message content.
-        
-        Args:
-            content: Message content (string, list, or dict)
-            compressor: ImageCompressor instance
-            quality: Compression quality to use. Can be:
-                - int: Fixed quality for all images
-                - callable: Function that takes relative image index and returns quality
-                - None: Use default quality
-        
-        Returns:
-            Tuple of (processed_content, list_of_compression_stats)
-        """
-        compression_stats = []
-        
-        if isinstance(content, str):
-            # Check for embedded base64 images in text/markdown
-            # This handles cases where images are embedded as data URLs in markdown
-            return content, compression_stats
-        
-        if isinstance(content, dict):
-            # Handle single content object
-            if content.get("type") == "image_url":
-                # Get quality - if it's a callable, call with index 0
-                q = quality(0) if callable(quality) else quality
-                processed, stats = self._process_image_url(content, compressor, q)
-                if stats:
-                    compression_stats.append(stats)
-                return processed, compression_stats
-            return content, compression_stats
-        
-        if isinstance(content, list):
-            # Handle list of content parts (multimodal)
-            processed_content = []
-            image_idx = 0
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    # Get quality - if it's a callable, call with relative index
-                    q = quality(image_idx) if callable(quality) else quality
-                    processed_part, stats = self._process_image_url(part, compressor, q)
-                    if stats:
-                        compression_stats.append(stats)
-                    processed_content.append(processed_part)
-                    image_idx += 1
-                else:
-                    processed_content.append(part)
-            return processed_content, compression_stats
-        
-        return content, compression_stats
-    
-    def _process_image_url(
-        self,
-        image_part: Dict[str, Any],
-        compressor: ImageCompressor,
-        quality: Optional[int] = None,
-    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-        """
-        Process a single image_url content part.
-        
-        Args:
-            image_part: Content part with type "image_url"
-            compressor: ImageCompressor instance
-            quality: Compression quality to use (None = use default)
-        
-        Returns:
-            Tuple of (processed_part, compression_stats or None)
-        """
-        image_url = image_part.get("image_url", {})
-        if isinstance(image_url, dict):
-            url = image_url.get("url", "")
-        else:
-            url = image_url
-            image_url = {"url": url}
-        
-        # Extract base64 data
-        base64_data, detected_format, original_url = extract_base64_data(url)
-        
-        if not base64_data:
-            # Not a base64 image (probably a URL), return as-is
-            self._log(f"Skipping non-base64 image: {url[:50]}...", level="debug")
-            return image_part, None
-        
-        # Check size
-        size_bytes = calculate_base64_size(base64_data)
-        
-        # Always log image detection for debugging
-        self._log(
-            f"Found image: format={detected_format or 'unknown'}, "
-            f"size={format_size(size_bytes)}, threshold={format_size(self.valves.max_image_size_bytes)}"
-        )
-        
-        # Check if compression is needed
-        should_compress = (
-            size_bytes > self.valves.max_image_size_bytes or
-            self.valves.enable_quality_gradient  # Always compress if quality gradient is enabled
-        )
-        
-        if not should_compress:
-            self._log(f"Image under size threshold, skipping compression")
-            return image_part, None
-        
-        # Check if Pillow is available
-        if not PILLOW_AVAILABLE:
-            self._log(
-                "Pillow not installed, cannot compress image. "
-                "Install with: pip install Pillow",
-                level="warning",
-            )
-            return image_part, None
-        
-        # Compress the image
-        try:
-            quality_str = f" (quality={quality})" if quality else ""
-            self._log(f"Compressing image ({format_size(size_bytes)} > {format_size(self.valves.max_image_size_bytes)}){quality_str}")
-            
-            compressed_base64, new_format, stats = compressor.compress_image(
-                base64_data, detected_format, quality
-            )
-            
-            # Log the compression result
-            self._log(
-                f"Compressed: {format_size(stats['original_size'])} → {format_size(stats['compressed_size'])} "
-                f"({stats['compression_ratio']:.1%} of original)"
-            )
-            
-            # Per-image fallback: if still too large after quality=20, mark for dropping
-            compressed_size = stats.get("compressed_size", 0)
-            if compressed_size > self.valves.max_image_size_bytes and quality > 20:
-                # Try again with lower quality
-                self._log(f"Image still too large ({format_size(compressed_size)}), retrying with quality=20")
-                compressed_base64, new_format, stats = compressor.compress_image(
-                    base64_data, detected_format, 20
+            logger.debug(f"[Status Emit] Failed: {e}")
+
+    def _timestamp_of(self, msg: Dict[str, Any]) -> Optional[int]:
+        if not isinstance(msg, dict):
+            return None
+        msg_ts = msg.get("timestamp")
+        if msg_ts is None:
+            msg_ts = msg.get("created_at")
+        if msg_ts is None:
+            return None
+        if isinstance(msg_ts, datetime):
+            try:
+                return int(msg_ts.timestamp())
+            except Exception:
+                return None
+        if isinstance(msg_ts, (int, float)):
+            return int(msg_ts)
+        if isinstance(msg_ts, str):
+            raw = msg_ts.strip()
+            if not raw:
+                return None
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                pass
+            try:
+                return int(
+                    datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
                 )
-                compressed_size = stats.get("compressed_size", 0)
-                
-                # If still too large after quality=20, mark for dropping
-                if compressed_size > self.valves.max_image_size_bytes:
-                    self._log(f"Image still too large after quality=20, marking for dropping")
-                    # Return a special marker to indicate this image should be dropped
-                    return {"type": "image_url", "image_url": {"url": "__DROP_IMAGE__"}}, {
-                        "was_compressed": True,
-                        "was_dropped": True,
-                        "original_size": stats.get("original_size"),
-                        "compressed_size": 0,
-                    }
-            
-            # Build new image URL
-            mime_type = MIME_TYPES.get(new_format, "image/jpeg")
-            new_url = f"data:{mime_type};base64,{compressed_base64}"
-            
-            # Build new image_part - IMPORTANT: Create a new dict, don't modify in place
-            new_image_part = {
-                "type": "image_url",
-                "image_url": {"url": new_url},
+            except Exception:
+                return None
+        return None
+
+    def _message_has_passthrough_media(self, message: Dict[str, Any]) -> bool:
+        return self._static_message_has_passthrough_media(message)
+
+    def _message_tokens(self, messages: List[Dict[str, Any]], indices: Set[int]) -> int:
+        total = 0
+        for i in indices:
+            if not (0 <= i < len(messages)):
+                continue
+            if self._message_has_passthrough_media(messages[i]):
+                continue
+            total += TokenCounter.count(messages[i])
+        return total
+
+    def _content_signature(self, content: Any) -> str:
+        if isinstance(content, str):
+            return f"str:{content[:200]}"
+        if isinstance(content, dict):
+            return f"dict:{content.get('type', '')}:{TokenCounter.extract_text(content)[:120]}"
+        if isinstance(content, list):
+            parts = []
+            for part in content[:8]:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("type", "dict")))
+                else:
+                    parts.append(type(part).__name__)
+            text = TokenCounter.extract_text(content)[:120]
+            return f"list:{'|'.join(parts)}:{text}"
+        return type(content).__name__
+
+    def _message_identity(self, msg: Dict[str, Any]) -> str:
+        if not isinstance(msg, dict):
+            return ""
+        for key in ("id", "message_id", "uuid"):
+            value = msg.get(key)
+            if value is not None:
+                value_str = str(value).strip()
+                if value_str:
+                    return f"id:{value_str}"
+        role = str(msg.get("role", ""))
+        ts = self._timestamp_of(msg)
+        sig = self._content_signature(msg.get("content", ""))
+        return f"fallback:{role}:{ts}:{sig}"
+
+    def _clean_message_history(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        if not messages:
+            return []
+        filtered = list(messages)
+        if filtered and not filtered[-1].get("content"):
+            filtered = filtered[:-1]
+        return filtered
+
+    def _unfold_messages(self, messages: Any) -> List[Dict[str, Any]]:
+        if not messages:
+            return []
+        result = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            msg = deepcopy(msg)
+            children = msg.pop("children", None)
+            if children:
+                if isinstance(children, list) and children:
+                    child = children[0] if isinstance(children[0], dict) else {}
+                    child_msg = {**msg, **child}
+                    child_msg.pop("children", None)
+                    result.append(child_msg)
+                else:
+                    result.append(msg)
+            else:
+                result.append(msg)
+        return result
+
+    def _normalize_messages(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        normalized = self._unfold_messages(messages)
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for msg in normalized:
+            identity = self._message_identity(msg)
+            if identity and identity in seen:
+                continue
+            if identity:
+                seen.add(identity)
+            deduped.append(msg)
+        indexed = list(enumerate(deduped))
+        indexed.sort(
+            key=lambda item: (
+                self._timestamp_of(item[1]) is None,
+                (
+                    self._timestamp_of(item[1])
+                    if self._timestamp_of(item[1]) is not None
+                    else 0
+                ),
+                item[0],
+            )
+        )
+        return [msg for _, msg in indexed]
+
+    def _load_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        return self._normalize_messages(
+            self._clean_message_history(self._load_db_messages_by_chat_id(chat_id))
+        )
+
+    def _merge_body_last_message(
+        self, messages: List[Dict[str, Any]], body: dict
+    ) -> List[Dict[str, Any]]:
+        merged = list(messages)
+        if not isinstance(body, dict):
+            return merged
+        body_messages = body.get("messages")
+        if not isinstance(body_messages, list) or not body_messages:
+            return merged
+        candidate = body_messages[-1]
+        if not isinstance(candidate, dict):
+            return merged
+        candidate_identity = self._message_identity(candidate)
+        if candidate_identity and any(
+            self._message_identity(msg) == candidate_identity for msg in merged
+        ):
+            return merged
+        merged.append(deepcopy(candidate))
+        return merged
+
+    def _merge_body_messages(
+        self, messages: List[Dict[str, Any]], body: dict
+    ) -> List[Dict[str, Any]]:
+        merged = [deepcopy(msg) for msg in messages]
+        if not isinstance(body, dict):
+            return merged
+        body_messages = body.get("messages")
+        if not isinstance(body_messages, list) or not body_messages:
+            return merged
+
+        index_by_identity: Dict[str, int] = {}
+        for i, msg in enumerate(merged):
+            identity = self._message_identity(msg)
+            if identity:
+                index_by_identity[identity] = i
+
+        for candidate in body_messages:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_copy = deepcopy(candidate)
+            identity = self._message_identity(candidate_copy)
+            if identity and identity in index_by_identity:
+                merged[index_by_identity[identity]] = candidate_copy
+            else:
+                merged.append(candidate_copy)
+                if identity:
+                    index_by_identity[identity] = len(merged) - 1
+        return merged
+
+    def _get_summary_state(self, chat_id: str) -> SummaryState:
+        summary_data = get_summary_from_store(chat_id)
+        if not summary_data:
+            return SummaryState(content="", until_ts=None, raw=None)
+        return SummaryState(
+            content=summary_data.get("content", "") or "",
+            until_ts=summary_data.get("until_timestamp"),
+            raw=summary_data,
+        )
+
+    def _split_message_pools(
+        self,
+        messages: List[Dict[str, Any]],
+        summary_time: Optional[int],
+        protected_start: int,
+        protected_end: int,
+    ) -> MessagePools:
+        total_msgs = len(messages)
+        protected_start = max(0, min(protected_start, total_msgs))
+        protected_end = max(0, min(protected_end, total_msgs))
+        start_end_idx = protected_start
+        tail_start_idx = max(0, total_msgs - protected_end)
+        protected_indices = set(range(start_end_idx))
+        protected_indices.update(range(tail_start_idx, total_msgs))
+        media_indices = {
+            i for i, msg in enumerate(messages) if self._message_has_passthrough_media(msg)
+        }
+        protected_indices.update(media_indices)
+        summary_indices = set()
+        if summary_time is not None:
+            for i, msg in enumerate(messages):
+                if i in media_indices:
+                    continue
+                msg_ts = self._timestamp_of(msg)
+                if msg_ts is not None and msg_ts <= summary_time:
+                    summary_indices.add(i)
+        summary_indices -= protected_indices
+        compressible_start = min(start_end_idx, tail_start_idx)
+        compressible_end = max(start_end_idx, tail_start_idx)
+        compressible_indices = (
+            set(range(compressible_start, compressible_end))
+            - summary_indices
+            - protected_indices
+            - media_indices
+        )
+        return MessagePools(
+            total_msgs=total_msgs,
+            protected_start=protected_start,
+            protected_end=protected_end,
+            tail_start_idx=tail_start_idx,
+            start_end_idx=start_end_idx,
+            summary_indices=summary_indices,
+            protected_indices=protected_indices,
+            compressible_indices=compressible_indices,
+        )
+
+    def _debug_pool_snapshot(
+        self,
+        chat_id: str,
+        messages: List[Dict[str, Any]],
+        pools: MessagePools,
+        summary_time: Optional[int],
+        label: str,
+    ):
+        if not self.valves.debug_logging:
+            return
+        try:
+            compressible_indices = sorted(pools.compressible_indices)
+            summary_indices = sorted(pools.summary_indices)
+            protected_indices = sorted(pools.protected_indices)
+            logger.debug(
+                "[Context Manager][%s][%s] total=%s summary_time=%s summary=%s/%s(%s tok) compressible=%s(%s tok) protected=%s(%s tok)",
+                label,
+                chat_id,
+                len(messages),
+                summary_time,
+                len(summary_indices),
+                len(messages),
+                self._message_tokens(messages, set(summary_indices)),
+                len(compressible_indices),
+                self._message_tokens(messages, set(compressible_indices)),
+                len(protected_indices),
+                self._message_tokens(messages, set(protected_indices)),
+            )
+        except Exception as exc:
+            logger.debug(f"[Context Manager][debug] snapshot failed: {exc}")
+
+    def _build_stats_message(
+        self,
+        messages: List[Dict[str, Any]],
+        summary_content: Optional[str],
+        until_ts: Optional[int],
+    ) -> str:
+        return self._generate_stats_event(
+            messages=messages,
+            summary=summary_content,
+            summary_time=until_ts,
+            protected_start=self.valves.keep_start_messages,
+            protected_end=self.valves.keep_last_messages,
+        )
+
+    def _generate_stats_event(
+        self,
+        messages: List[Dict[str, Any]],
+        summary: Optional[str] = None,
+        summary_time: Optional[int] = None,
+        protected_start: int = 0,
+        protected_end: int = 0,
+    ) -> str:
+        if not messages:
+            return "🪙 0 │ 🛡️ 0 (0) · ⏳ 0 (0) · 📦 0 (0)"
+        pools = self._split_message_pools(
+            messages, summary_time, protected_start, protected_end
+        )
+        summary_tokens = TokenCounter.count(summary) if summary else 0
+        summarised_msgs = len(pools.summary_indices)
+        summarised_tokens = self._message_tokens(messages, pools.summary_indices)
+        protected_msgs = len(pools.protected_indices)
+        protected_tokens = self._message_tokens(messages, pools.protected_indices)
+        compressible_msgs = len(pools.compressible_indices)
+        compressible_tokens = self._message_tokens(messages, pools.compressible_indices)
+
+        def fmt(n: int) -> str:
+            if n >= 1000:
+                return f"{n/1000:.1f}k"
+            return str(int(n))
+
+        efficiency_part = ""
+        if summarised_tokens > 0 and summary:
+            efficiency = (1 - (summary_tokens / summarised_tokens)) * 100
+            efficiency_part = f" @ {round(efficiency, 1)}%"
+        projected_tokens = summary_tokens + protected_tokens + compressible_tokens
+        return (
+            f"🪙 {fmt(projected_tokens)} │ "
+            f"🛡️ {fmt(protected_tokens)} ({protected_msgs}) · "
+            f"⏳ {fmt(compressible_tokens)} ({compressible_msgs}) · "
+            f"📦 {fmt(summary_tokens)} ({summarised_msgs}{efficiency_part})"
+        )
+
+    def _is_message_after_timestamp(
+        self, message: Dict[str, Any], timestamp: int
+    ) -> bool:
+        msg_ts = self._timestamp_of(message)
+        if msg_ts is None:
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = str(part.get("type", "")).strip().lower()
+                    if part_type in {"image_url", "file", "input_image", "input_file"}:
+                        return True
+            elif isinstance(content, dict):
+                part_type = str(content.get("type", "")).strip().lower()
+                if part_type in {"image_url", "file", "input_image", "input_file"}:
+                    return True
+            # Messages without timestamps are typically current in-flight request messages.
+            return True
+        return msg_ts > timestamp
+
+    def _trim_message_content(
+        self, messages: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        if self.valves.tool_trim_threshold > 0:
+            return self.reconstructor.trim_tool_content(
+                messages,
+                self.valves.tool_trim_threshold,
+            )
+        return list(messages), {"trimmed_count": 0, "chars_removed": 0}
+
+    def _normalize_trim_mode(self) -> str:
+        raw = str(self.valves.protected_tool_trim_mode or "never").strip().lower()
+        if raw not in {"never", "overflow_only", "always"}:
+            return "never"
+        return raw
+
+    def _should_trim_protected_for_inlet(
+        self,
+        messages: List[Dict[str, Any]],
+        summary_state: SummaryState,
+    ) -> bool:
+        mode = self._normalize_trim_mode()
+        if mode == "never":
+            return False
+        if mode == "always":
+            return True
+        projected_tokens = sum(
+            TokenCounter.count(m)
+            for m in messages
+            if not self._message_has_passthrough_media(m)
+        )
+        if summary_state.raw:
+            pools = self._split_message_pools(
+                messages,
+                summary_state.until_ts,
+                self.valves.keep_start_messages,
+                self.valves.keep_last_messages,
+            )
+            summary_tokens = TokenCounter.count(summary_state.content)
+            summarised_tokens = self._message_tokens(messages, pools.summary_indices)
+            projected_tokens = projected_tokens - summarised_tokens + summary_tokens
+        return projected_tokens > self.valves.max_context_tokens
+
+    def _build_inlet_trim_targets(
+        self,
+        messages: List[Dict[str, Any]],
+        summary_state: SummaryState,
+        pools: MessagePools,
+    ) -> Tuple[Set[int], bool]:
+        target_indices = set(pools.compressible_indices)
+        trim_protected = self._should_trim_protected_for_inlet(messages, summary_state)
+        if trim_protected:
+            target_indices.update(pools.protected_indices)
+        return target_indices, trim_protected
+
+    def _build_inlet_messages(
+        self,
+        db_messages: List[Dict[str, Any]],
+        summary_state: SummaryState,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        pools = self._split_message_pools(
+            db_messages,
+            summary_state.until_ts,
+            self.valves.keep_start_messages,
+            self.valves.keep_last_messages,
+        )
+        target_indices, trim_protected = self._build_inlet_trim_targets(
+            db_messages, summary_state, pools
+        )
+        target_indices = {
+            i for i in target_indices
+            if 0 <= i < len(db_messages) and not self._message_has_passthrough_media(db_messages[i])
+        }
+        trimmed_messages, trim_stats = self.reconstructor.trim_tool_content(
+            db_messages,
+            self.valves.tool_trim_threshold,
+            target_indices=target_indices,
+        )
+        trim_stats["protected_trim_applied"] = 1 if trim_protected else 0
+        if summary_state.raw:
+            summary_msg = {
+                "role": "system",
+                "content": f"<{SUMMARY_TAG}>\n{summary_state.content}\n</{SUMMARY_TAG}>",
             }
-            
-            # Add compression info to stats
-            stats["was_compressed"] = True
-            stats["threshold_bytes"] = self.valves.max_image_size_bytes
-            
-            return new_image_part, stats
-            
-        except Exception as e:
-            self._log(f"Failed to compress image: {e}", level="error")
-            # Return original on error
-            return image_part, None
-    
+            active_messages = [summary_msg]
+            if summary_state.until_ts is not None:
+                for msg in trimmed_messages:
+                    if self._message_has_passthrough_media(msg) or self._is_message_after_timestamp(msg, summary_state.until_ts):
+                        active_messages.append(msg)
+            else:
+                active_messages.extend(trimmed_messages)
+        else:
+            active_messages = trimmed_messages
+        active_messages = self._normalize_messages(active_messages)
+        return active_messages, trim_stats
+
+    def _compression_metrics(
+        self,
+        messages: List[Dict[str, Any]],
+        pools: MessagePools,
+    ) -> Tuple[int, int]:
+        compressible_tokens = self._message_tokens(messages, pools.compressible_indices)
+        protected_tokens = self._message_tokens(messages, pools.protected_indices)
+        threshold_tokens = (
+            compressible_tokens + protected_tokens
+            if self.valves.include_protected_in_threshold
+            else compressible_tokens
+        )
+        return compressible_tokens, threshold_tokens
+
+    def _build_canonical_raw_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        return self._load_chat_messages(chat_id)
+
+    def _build_active_request_messages(
+        self,
+        chat_id: str,
+        body: dict,
+    ) -> List[Dict[str, Any]]:
+        return self._normalize_messages(
+            self._merge_body_messages(self._build_canonical_raw_messages(chat_id), body)
+        )
+
+    def _prepare_outlet_state(
+        self,
+        chat_id: str,
+        body: dict,
+    ) -> Dict[str, Any]:
+        messages_raw = self._build_canonical_raw_messages(chat_id)
+        messages_raw = self._normalize_messages(
+            self._merge_body_last_message(messages_raw, body)
+        )
+        summary_state = self._get_summary_state(chat_id)
+        raw_pools = self._split_message_pools(
+            messages_raw,
+            summary_state.until_ts,
+            self.valves.keep_start_messages,
+            self.valves.keep_last_messages,
+        )
+        raw_compressible_tokens, raw_threshold_tokens = self._compression_metrics(
+            messages_raw, raw_pools
+        )
+        messages_working, trim_stats = self._trim_message_content(messages_raw)
+        messages_working = self._normalize_messages(messages_working)
+        working_pools = self._split_message_pools(
+            messages_working,
+            summary_state.until_ts,
+            self.valves.keep_start_messages,
+            self.valves.keep_last_messages,
+        )
+        working_compressible = [
+            messages_working[i]
+            for i in sorted(working_pools.compressible_indices)
+            if not self._message_has_passthrough_media(messages_working[i])
+        ]
+        active_source_messages = self._build_active_request_messages(chat_id, body)
+        return {
+            "messages_raw": messages_raw,
+            "messages_working": messages_working,
+            "summary_state": summary_state,
+            "raw_pools": raw_pools,
+            "working_pools": working_pools,
+            "raw_compressible_tokens": raw_compressible_tokens,
+            "raw_threshold_tokens": raw_threshold_tokens,
+            "working_compressible": working_compressible,
+            "trim_stats": trim_stats,
+            "active_source_messages": active_source_messages,
+        }
+
+    def _get_chat_id(self, body: dict, metadata: Optional[dict]) -> Optional[str]:
+        if metadata and isinstance(metadata, dict):
+            chat_id = metadata.get("chat_id") or metadata.get("chatId")
+            if chat_id:
+                return str(chat_id)
+        if body and isinstance(body, dict):
+            chat_id = body.get("chat_id") or body.get("chatId")
+            if chat_id:
+                return str(chat_id)
+            meta = body.get("meta", {})
+            if isinstance(meta, dict):
+                chat_id = meta.get("chat_id") or meta.get("chatId")
+                if chat_id:
+                    return str(chat_id)
+        return None
+
+    def _load_db_messages_by_chat_id(self, chat_id: str) -> List[Dict[str, Any]]:
+        if not chat_id or Chats is None:
+            return []
+        try:
+            chat_record = Chats.get_chat_by_id(chat_id)
+        except Exception as exc:
+            logger.warning(f"[Chat Load] Failed to fetch chat {chat_id}: {exc}")
+            return []
+        chat_payload = getattr(chat_record, "chat", None)
+        if not isinstance(chat_payload, dict):
+            return []
+        direct_messages = chat_payload.get("messages")
+        if isinstance(direct_messages, list) and direct_messages:
+            return self._unfold_messages(deepcopy(direct_messages))
+        history = chat_payload.get("history")
+        if not isinstance(history, dict):
+            return []
+        history_messages = history.get("messages")
+        if not isinstance(history_messages, dict) or not history_messages:
+            return []
+        current_id = history.get("currentId") or history.get("current_id")
+        return self._unfold_messages(
+            self._reconstruct_active_history_branch(history_messages, current_id)
+        )
+
+    def _reconstruct_active_history_branch(
+        self, history_messages: Any, current_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(history_messages, dict) or not history_messages:
+            return []
+        if isinstance(current_id, str) and current_id in history_messages:
+            ordered_messages: List[Dict[str, Any]] = []
+            visited = set()
+            cursor = current_id
+            while isinstance(cursor, str) and cursor and cursor not in visited:
+                visited.add(cursor)
+                node = history_messages.get(cursor)
+                if not isinstance(node, dict):
+                    break
+                ordered_messages.append(deepcopy(node))
+                cursor = node.get("parentId") or node.get("parent_id")
+            if ordered_messages:
+                ordered_messages.reverse()
+                return ordered_messages
+        sortable_messages = []
+        for index, node in enumerate(history_messages.values()):
+            if not isinstance(node, dict):
+                continue
+            timestamp = self._timestamp_of(node)
+            if timestamp is None:
+                timestamp = index
+            sortable_messages.append((float(timestamp), index, deepcopy(node)))
+        sortable_messages.sort(key=lambda item: (item[0], item[1]))
+        return [message for _, _, message in sortable_messages]
+
     async def inlet(
         self,
         body: dict,
-        __user__: Optional[dict] = None,
-        __metadata__: Optional[dict] = None,
-        __event_emitter__: Optional[callable] = None,
-        __event_call__: Optional[callable] = None,
-        __model__: Optional[dict] = None,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: Callable = None,
+        __event_call__: Callable = None,
+        __request__: Request = None,
     ) -> dict:
-        """
-        Process messages before sending to LLM.
-        Compresses images that exceed the size threshold.
-        
-        IMPORTANT: This filter should run AFTER context compression (priority > 10)
-        so it processes the final message list that will be sent to the LLM.
-        """
-        if not PILLOW_AVAILABLE:
-            self._log(
-                "Pillow not installed. Image compression disabled. "
-                "Install with: pip install Pillow",
-                level="warning",
-            )
+        chat_id = self._get_chat_id(body, __metadata__)
+        if not chat_id:
             return body
-        
-        messages = body.get("messages", [])
-        if not messages:
-            return body
-        
-        # Check if model supports vision (if vision detection is enabled)
-        if self.valves.enable_vision_detection:
-            supports_vision = model_supports_vision(__model__)
-            self._log(f"Model vision support: {supports_vision}")
-            
-            if not supports_vision and self.valves.drop_images_for_non_vision:
-                # Drop all images and replace with text placeholder
-                self._log("Model doesn't support vision, dropping all images")
-                dropped_count = 0
-                descriptions_generated = 0
-                
-                for message in messages:
-                    if not isinstance(message, dict):
-                        continue
-                    
-                    content = message.get("content")
-                    if not content:
-                        continue
-                    
-                    # Check if this message has images
-                    if isinstance(content, list):
-                        new_content = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "image_url":
-                                # Try to generate a description if smart drop is enabled
-                                placeholder_text = "[Image dropped - model doesn't support vision]"
-                                
-                                if self.valves.enable_smart_drop:
-                                    # Extract base64 data from the image
-                                    image_url = part.get("image_url", {})
-                                    if isinstance(image_url, dict):
-                                        url = image_url.get("url", "")
-                                    else:
-                                        url = image_url
-                                    
-                                    base64_data, _, _ = extract_base64_data(url)
-                                    
-                                    if base64_data:
-                                        description = generate_smart_image_description(
-                                            base64_data,
-                                            use_ocr=self.valves.use_ocr,
-                                            debug=self.valves.debug_mode,
-                                        )
-                                        if description and description != "[Image content not available - could not extract description]":
-                                            placeholder_text = f"[Image: {description}]"
-                                            descriptions_generated += 1
-                                            self._log(f"Generated description for dropped image: {description[:100]}...")
-                                        else:
-                                            placeholder_text = "[Image dropped - model doesn't support vision]"
-                                    else:
-                                        self._log("Could not extract base64 data for smart description")
-                                else:
-                                    if self.valves.debug_mode:
-                                        self._log("Smart drop disabled, using simple placeholder")
-                                
-                                new_content.append({
-                                    "type": "text",
-                                    "text": placeholder_text
-                                })
-                                dropped_count += 1
-                            else:
-                                new_content.append(part)
-                        message["content"] = new_content
-                    elif isinstance(content, dict) and content.get("type") == "image_url":
-                        # Try to generate a description if smart drop is enabled
-                        placeholder_text = "[Image dropped - model doesn't support vision]"
-                        
-                        if self.valves.enable_smart_drop:
-                            image_url = content.get("image_url", {})
-                            if isinstance(image_url, dict):
-                                url = image_url.get("url", "")
-                            else:
-                                url = image_url
-                            
-                            base64_data, _, _ = extract_base64_data(url)
-                            
-                            if base64_data:
-                                description = generate_smart_image_description(
-                                    base64_data,
-                                    quality=self.valves.description_quality,
-                                    use_ocr=self.valves.use_ocr,
-                                    model_info=__model__,
-                                    debug=self.valves.debug_mode,
-                                )
-                                if description and description != "[Image content not available - could not extract description]":
-                                    placeholder_text = f"[Image: {description}]"
-                                    descriptions_generated += 1
-                                    self._log(f"Generated description for dropped image: {description[:100]}...")
-                                else:
-                                    placeholder_text = "[Image dropped - model doesn't support vision]"
-                        
-                        message["content"] = [
-                            {"type": "text", "text": placeholder_text}
-                        ]
-                        dropped_count += 1
-                
-                if dropped_count > 0:
-                    status_msg = f"🖼️ Dropped {dropped_count} image(s) - model doesn't support vision"
-                    if descriptions_generated > 0:
-                        status_msg += f" ({descriptions_generated} with descriptions)"
-                    await self._emit_status(
-                        status_msg,
-                        __event_emitter__,
-                    )
-                    self._log(f"Dropped {dropped_count} image(s) due to no vision support ({descriptions_generated} with descriptions)")
-                
-                return body
-        
-        # Debug: Log incoming message structure
-        total_images = sum(self._count_images_in_content(msg.get("content")) for msg in messages if isinstance(msg, dict))
-        self._log(f"Processing {len(messages)} messages with {total_images} image(s)")
-        
-        # Calculate initial payload size estimate
-        initial_payload_size = len(json.dumps(body, default=str))
-        self._log(f"Initial payload size: {format_size(initial_payload_size)}")
-        
-        await self._emit_debug_log(
-            f"Inlet: {len(messages)} messages, {total_images} images, payload: {format_size(initial_payload_size)}",
-            __event_call__,
+        messages_raw = self._build_canonical_raw_messages(chat_id)
+        active_source_messages = self._build_active_request_messages(chat_id, body)
+        summary_state = self._get_summary_state(chat_id)
+        active_messages, trim_stats = self._build_inlet_messages(
+            active_source_messages, summary_state
         )
-        
-        # Create compressor instance
-        compressor = ImageCompressor(
-            max_size_bytes=self.valves.max_image_size_bytes,
-            convert_png_to_jpeg=self.valves.convert_png_to_jpeg,
-            preserve_transparency=self.valves.preserve_transparency,
-            debug=self.valves.debug_mode,
+        body["messages"] = active_messages
+        inlet_pools = self._split_message_pools(
+            messages_raw,
+            summary_state.until_ts,
+            self.valves.keep_start_messages,
+            self.valves.keep_last_messages,
         )
-        
-        total_compressed = 0
-        total_saved = 0
-        compression_details = []
-        
-        # Collect all image positions first (for quality gradient calculation)
-        image_positions = []  # List of (message_index, image_index_in_message)
-        for msg_idx, message in enumerate(messages):
-            if not isinstance(message, dict):
-                continue
-            content = message.get("content")
-            if not content:
-                continue
-            # Count images in this message
-            if isinstance(content, list):
-                for part_idx, part in enumerate(content):
-                    if isinstance(part, dict) and part.get("type") == "image_url":
-                        image_positions.append((msg_idx, part_idx))
-            elif isinstance(content, dict) and content.get("type") == "image_url":
-                image_positions.append((msg_idx, 0))
-        
-        total_images = len(image_positions)
-        self._log(f"Found {total_images} images to process")
-        
-        # Process each message - IMPORTANT: Create new list to ensure changes persist
-        new_messages = []
-        current_image_idx = 0
-        for i, message in enumerate(messages):
-            if not isinstance(message, dict):
-                new_messages.append(message)
-                continue
-            
-            # Create a copy of the message
-            new_message = dict(message)
-            
-            content = new_message.get("content")
-            if not content:
-                new_messages.append(new_message)
-                continue
-            
-            # Count images in this message first
-            image_count_in_message = 0
-            if isinstance(content, list):
-                image_count_in_message = sum(
-                    1 for part in content
-                    if isinstance(part, dict) and part.get("type") == "image_url"
-                )
-            elif isinstance(content, dict) and content.get("type") == "image_url":
-                image_count_in_message = 1
-            
-            # Calculate quality for this message's images (if quality gradient is enabled)
-            def get_image_quality(relative_idx: int) -> int:
-                if not self.valves.enable_quality_gradient or total_images <= 1:
-                    return self.valves.recent_image_quality
-                # Calculate quality based on position (0 = oldest, total_images-1 = newest)
-                # Recent images (higher index) get higher quality
-                absolute_idx = current_image_idx + relative_idx
-                ratio = absolute_idx / max(1, total_images - 1)
-                quality = int(
-                    self.valves.old_image_quality +
-                    ratio * (self.valves.recent_image_quality - self.valves.old_image_quality)
-                )
-                return quality
-            
-            processed_content, stats_list = self._process_image_in_message(
-                content, compressor, get_image_quality
-            )
-            
-            # Handle dropped images (marked with "__DROP_IMAGE__")
-            dropped_in_message = 0
-            if isinstance(processed_content, list):
-                new_content = []
-                for part in processed_content:
-                    if isinstance(part, dict):
-                        img_url = part.get("image_url", {})
-                        if isinstance(img_url, dict):
-                            url = img_url.get("url", "")
-                        else:
-                            url = img_url
-                        if url == "__DROP_IMAGE__":
-                            # Replace with placeholder text
-                            new_content.append({
-                                "type": "text",
-                                "text": "[Image dropped due to size constraints]"
-                            })
-                            dropped_in_message += 1
-                        else:
-                            new_content.append(part)
-                    else:
-                        new_content.append(part)
-                processed_content = new_content
-            elif isinstance(processed_content, dict):
-                img_url = processed_content.get("image_url", {})
-                if isinstance(img_url, dict):
-                    url = img_url.get("url", "")
-                else:
-                    url = img_url
-                if url == "__DROP_IMAGE__":
-                    processed_content = [
-                        {"type": "text", "text": "[Image dropped due to size constraints]"}
-                    ]
-                    dropped_in_message = 1
-            
-            # Update image index for next images in this message
-            current_image_idx += image_count_in_message
-            
-            if stats_list:
-                # IMPORTANT: Update the content in the new message
-                new_message["content"] = processed_content
-                for stats in stats_list:
-                    if stats.get("was_compressed"):
-                        total_compressed += 1
-                        if stats.get("was_dropped"):
-                            # Count dropped images separately
-                            self._log(f"Dropped image in message {i}")
-                        else:
-                            saved = stats.get("original_size", 0) - stats.get("compressed_size", 0)
-                            total_saved += saved
-                            compression_details.append({
-                                "message_index": i,
-                                "original_format": stats.get("original_format"),
-                                "new_format": stats.get("new_format"),
-                                "original_size": stats.get("original_size"),
-                                "compressed_size": stats.get("compressed_size"),
-                                "saved_bytes": saved,
-                            })
-            
-            new_messages.append(new_message)
-        
-        # IMPORTANT: Update body with new messages list
-        body["messages"] = new_messages
-        
-        # Log summary
-        if total_compressed > 0:
-            self._log(
-                f"Compressed {total_compressed} image(s), saved {format_size(total_saved)}"
-            )
-            
-            # Emit status notification
-            await self._emit_status(
-                f"🖼️ Compressed {total_compressed} image(s) - saved {format_size(total_saved)}",
-                __event_emitter__,
-            )
-            
-            await self._emit_debug_log(
-                f"Compressed {total_compressed} image(s), saved {format_size(total_saved)}",
-                __event_call__,
-            )
-            
-            if self.valves.debug_mode:
-                for detail in compression_details:
-                    self._log(
-                        f"  Message {detail['message_index']}: "
-                        f"{detail['original_format']}→{detail['new_format']}, "
-                        f"{format_size(detail['original_size'])}→{format_size(detail['compressed_size'])}",
-                        level="debug",
-                    )
-        else:
-            self._log(f"No images needed compression (checked {total_images} images)")
-            await self._emit_debug_log(
-                f"No compression needed (checked {total_images} images)",
-                __event_call__,
-            )
-        
-        # Calculate final payload size
-        final_payload_size = len(json.dumps(body, default=str))
-        
-        # Fallback: If payload still too large, drop oldest images
-        if final_payload_size > self.valves.max_payload_size_bytes:
-            self._log(
-                f"Payload too large ({format_size(final_payload_size)} > {format_size(self.valves.max_payload_size_bytes)}), "
-                f"dropping oldest images..."
-            )
-            
-            messages = body.get("messages", [])
-            dropped_count = 0
-            
-            # Drop oldest images (from beginning of message list)
-            for msg_idx, message in enumerate(messages):
-                if not isinstance(message, dict):
-                    continue
-                
-                content = message.get("content")
-                if not content:
-                    continue
-                
-                # Check if this message has images
-                has_images = False
-                if isinstance(content, list):
-                    has_images = any(
-                        isinstance(part, dict) and part.get("type") == "image_url"
-                        for part in content
-                    )
-                elif isinstance(content, dict) and content.get("type") == "image_url":
-                    has_images = True
-                
-                if has_images:
-                    # Replace image with a placeholder text
-                    if isinstance(content, list):
-                        new_content = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "image_url":
-                                # Replace with placeholder
-                                new_content.append({
-                                    "type": "text",
-                                    "text": "[Image dropped due to size constraints]"
-                                })
-                                dropped_count += 1
-                            else:
-                                new_content.append(part)
-                        message["content"] = new_content
-                    elif isinstance(content, dict) and content.get("type") == "image_url":
-                        message["content"] = [
-                            {"type": "text", "text": "[Image dropped due to size constraints]"}
-                        ]
-                        dropped_count += 1
-                    
-                    # Check if payload is now small enough
-                    final_payload_size = len(json.dumps(body, default=str))
-                    if final_payload_size <= self.valves.max_payload_size_bytes:
-                        self._log(
-                            f"Payload now {format_size(final_payload_size)} after dropping {dropped_count} image(s)"
-                        )
-                        break
-            
-            if dropped_count > 0:
-                await self._emit_status(
-                    f"🖼️ Dropped {dropped_count} image(s) due to size constraints",
-                    __event_emitter__,
-                )
-        
-        self._log(f"Final payload size: {format_size(final_payload_size)} (saved {format_size(initial_payload_size - final_payload_size)})")
-        
-        await self._emit_debug_log(
-            f"Final payload: {format_size(final_payload_size)}",
-            __event_call__,
+        self._debug_pool_snapshot(
+            chat_id, messages_raw, inlet_pools, summary_state.until_ts, "inlet"
         )
-        
+        if self.valves.debug_logging:
+            try:
+                logger.debug(
+                    "[Context Manager][inlet][%s] canonical=%s active_source=%s",
+                    chat_id,
+                    len(messages_raw),
+                    len(active_source_messages),
+                )
+            except Exception:
+                pass
+        if self.valves.debug_logging and trim_stats.get("trimmed_count"):
+            protected_note = (
+                " protected=on" if trim_stats.get("protected_trim_applied") else ""
+            )
+            logger.debug(
+                "[Context Manager][inlet][%s] tool trim applied in-memory only: trimmed=%s removed_chars=%s%s",
+                chat_id,
+                trim_stats.get("trimmed_count", 0),
+                trim_stats.get("chars_removed", 0),
+                protected_note,
+            )
+        stats_message = self._build_stats_message(
+            messages=messages_raw,
+            summary_content=summary_state.content,
+            until_ts=summary_state.until_ts,
+        )
+        await self._emit_status(__event_emitter__, f"🔄{stats_message}", done=True)
         return body
-    
+
     async def outlet(
         self,
         body: dict,
-        __user__: Optional[dict] = None,
-        __metadata__: Optional[dict] = None,
-        __event_emitter__: Optional[callable] = None,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: Callable = None,
+        __event_call__: Callable = None,
+        __request__: Request = None,
     ) -> dict:
-        """
-        Process messages after receiving LLM response.
-        Typically no images in responses, but pass through unchanged.
-        """
+        chat_id = self._get_chat_id(body, __metadata__)
+        if not chat_id:
+            return body
+        outlet_state = self._prepare_outlet_state(chat_id, body)
+        messages_raw = outlet_state["messages_raw"]
+        messages_working = outlet_state["messages_working"]
+        summary_state = outlet_state["summary_state"]
+        working_pools = outlet_state["working_pools"]
+        raw_compressible_tokens = outlet_state["raw_compressible_tokens"]
+        raw_threshold_tokens = outlet_state["raw_threshold_tokens"]
+        working_compressible = outlet_state["working_compressible"]
+        trim_stats = outlet_state["trim_stats"]
+        active_source_messages = outlet_state["active_source_messages"]
+        self._debug_pool_snapshot(
+            chat_id,
+            messages_working,
+            working_pools,
+            summary_state.until_ts,
+            "outlet-before",
+        )
+        if self.valves.debug_logging:
+            try:
+                logger.debug(
+                    "[Context Manager][outlet][%s] canonical=%s active_source=%s",
+                    chat_id,
+                    len(messages_raw),
+                    len(active_source_messages),
+                )
+            except Exception:
+                pass
+        if self.valves.debug_logging and trim_stats.get("trimmed_count"):
+            logger.debug(
+                "[Context Manager][outlet][%s] tool trim applied to summarization snapshot only: trimmed=%s removed_chars=%s",
+                chat_id,
+                trim_stats.get("trimmed_count", 0),
+                trim_stats.get("chars_removed", 0),
+            )
+        if (
+            raw_threshold_tokens > self.valves.compression_threshold_tokens
+            and working_compressible
+        ):
+            await self._emit_status(
+                __event_emitter__,
+                f"Summarizing {raw_compressible_tokens:,} new tokens...",
+                done=False,
+            )
+            lock = self._lock_for(chat_id)
+            if not lock.locked():
+                await self._background_compress(
+                    lock,
+                    chat_id,
+                    summary_state.content,
+                    working_compressible,
+                    self.valves.summary_model or body.get("model"),
+                    __user__,
+                    __event_emitter__,
+                    __request__,
+                )
+                summary_state = self._get_summary_state(chat_id)
+                refreshed_working_pools = self._split_message_pools(
+                    messages_working,
+                    summary_state.until_ts,
+                    self.valves.keep_start_messages,
+                    self.valves.keep_last_messages,
+                )
+                self._debug_pool_snapshot(
+                    chat_id,
+                    messages_working,
+                    refreshed_working_pools,
+                    summary_state.until_ts,
+                    "outlet-after",
+                )
+        stats_message = self._build_stats_message(
+            messages=messages_raw,
+            summary_content=summary_state.content,
+            until_ts=summary_state.until_ts,
+        )
+        await self._emit_status(__event_emitter__, f"✅{stats_message}", done=True)
         return body
-    
-    async def stream(
+
+    async def _background_compress(
         self,
-        event: dict,
-        __user__: Optional[dict] = None,
-        __metadata__: Optional[dict] = None,
-    ) -> dict:
-        """
-        Process streaming events.
-        Pass through unchanged.
-        """
-        return event
+        lock: asyncio.Lock,
+        chat_id: str,
+        old_summary_content: str,
+        compressible: List[Dict[str, Any]],
+        model_id: Optional[str],
+        user_data: Optional[dict],
+        emitter: Optional[Callable],
+        request: Optional[Request],
+    ):
+        async with lock:
+            try:
+                if not model_id:
+                    await self._emit_status(emitter, "⚠️ Summary failed: missing model")
+                    return
+                if not compressible:
+                    return
+                pool_text = "\n".join(
+                    f"{m.get('role', 'user').upper()}: {TokenCounter.extract_text(m.get('content', ''))}"
+                    for m in compressible
+                    if m.get("role") != "system"
+                ).strip()
+                if not pool_text:
+                    return
+                prompt = f"""
+You are the \"Context Architect\" responsible for maintaining a conversation's Permanent Archive.
+### CURRENT ARCHIVE:
+{old_summary_content or "No existing archive."}
+### NEW EVENTS TO INTEGRATE:
+{pool_text}
+### YOUR TASK:
+Integrate the NEW EVENTS into the CURRENT ARCHIVE to create a single, cohesive, and updated summary.
+### GUIDELINES:
+1. UPDATE FACTS: If new information contradicts or evolves the archive, update the record accordingly.
+2. CATEGORIZE: Maintain sections for [General Context], [User Preferences], and [Key Narrative/Context].
+3. DEDUPLICATE: Do not repeat information already clearly stated in the archive.
+4. BE ATOMIC: Use concise bullet points. Focus on what was decided and what is the current state.
+5. IGNORE: Discard greetings, meta-talk about the AI, image payload details, and transient errors unless materially important.
+### OUTPUT:
+Provide ONLY the updated archive text. No conversational filler, no markdown blocks, no \"Here is the summary.\"
+"""
+                user = None
+                if user_data and user_data.get("id"):
+                    user = await asyncio.to_thread(
+                        Users.get_user_by_id, user_data.get("id")
+                    )
+                if user is None:
+                    await self._emit_status(
+                        emitter, "⚠️ Summary failed: missing user context"
+                    )
+                    return
+                payload = {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "temperature": 0,
+                }
+                active_request = request or Request(scope={"type": "http"})
+                response = await generate_chat_completion(active_request, payload, user)
+                if hasattr(response, "body"):
+                    response = json.loads(response.body.decode())
+                if not (
+                    response and isinstance(response, dict) and response.get("choices")
+                ):
+                    await self._emit_status(
+                        emitter, "⚠️ Summary failed: invalid model response"
+                    )
+                    return
+                new_summary_content = response["choices"][0]["message"][
+                    "content"
+                ].strip()
+                if not new_summary_content:
+                    await self._emit_status(emitter, "⚠️ Summary failed: empty summary")
+                    return
+                valid_ts = [self._timestamp_of(m) for m in compressible]
+                valid_ts = [ts for ts in valid_ts if ts is not None]
+                until_ts = (
+                    max(valid_ts)
+                    if valid_ts
+                    else int(datetime.now(timezone.utc).timestamp())
+                )
+                store = _get_store()
+                if store is None:
+                    await self._emit_status(
+                        emitter, "⚠️ Summary failed: storage not available"
+                    )
+                    return
+                saved = store.save(
+                    chat_id=chat_id,
+                    content=new_summary_content,
+                    until_timestamp=until_ts,
+                )
+                if not saved:
+                    await self._emit_status(
+                        emitter, "⚠️ Summary generated but save failed"
+                    )
+                    return
+                pool_tokens = sum(
+                    TokenCounter.count(m)
+                    for m in compressible
+                    if not self._message_has_passthrough_media(m)
+                )
+                summary_tokens = TokenCounter.count(new_summary_content)
+                efficiency = None
+                if pool_tokens > 0:
+                    efficiency = max(
+                        0.0, min(100.0, (1.0 - (summary_tokens / pool_tokens)) * 100.0)
+                    )
+                eff_str = (
+                    f" {efficiency:.2f}% efficiency" if efficiency is not None else ""
+                )
+                await self._emit_status(emitter, f"💾 Summary saved!{eff_str}")
+            except Exception as e:
+                logger.error(
+                    f"[Context Manager] Background compression failed: {e}",
+                    exc_info=True,
+                )
+                await self._emit_status(emitter, f"⚠️ Summary failed: {str(e)[:80]}")
