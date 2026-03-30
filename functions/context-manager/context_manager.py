@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.3-dev.9
+version: 0.0.3-dev.10
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -1153,8 +1153,6 @@ class Filter:
             summary_state,
         )
         
-        logger.info(view.final_messages)
-    
         body["messages"] = view.final_messages
 
         self._debug_runtime_view(chat_id, "inlet", view, summary_state)
