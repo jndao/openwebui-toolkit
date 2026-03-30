@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that maintains a permanent, compressed archive of technical decisions and user preferences while preserving full UI fidelity and token efficiency.
-version: 0.0.1
+version: 0.0.2
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -452,6 +452,7 @@ class ContextReconstructor:
 
 class Filter:
     class Valves(BaseModel):
+        emit_status_events: int = Field(default=True, description="Toggle whether to show user's token usage statistics")
         compression_threshold_tokens: int = Field(default=30000)
         max_context_tokens: int = Field(default=120000)
         keep_start_messages: int = Field(default=0)
@@ -477,7 +478,7 @@ class Filter:
     async def _emit_status(
         self, emitter: Optional[Callable], message: str, done: bool = True
     ):
-        if emitter is None:
+        if emitter is None or not self.valves.emit_status_events:
             return
         try:
             await emitter(
