@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.3-dev.11
+version: 0.0.3-dev.12
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -1297,15 +1297,29 @@ Integrate the NEW EVENTS into the CURRENT ARCHIVE to create a single, cohesive, 
 
 ### GUIDELINES:
 1. UPDATE FACTS: If new information contradicts or evolves the archive, update the record accordingly.
-2. CATEGORIZE: Maintain sections for [General Context], [User Preferences], and [Key Narrative/Context].
+2. CATEGORIZE: Maintain sections for [General Context], [User Preferences], [Technical Decisions], [Final Code/Config], and [Open Issues].
 3. DEDUPLICATE: Do not repeat information already clearly stated in the archive.
-4. BE ATOMIC: Use concise bullet points. Focus on what was decided and what is the current state.
-5. IGNORE: Discard greetings, meta-talk about the AI, image payload details, and transient errors unless materially important.
+4. BE ATOMIC: Use concise bullet points. Focus on what was decided, what changed, and the current state.
+5. PRESERVE FINAL IMPLEMENTATIONS:
+   - Preserve verbatim code/config/command snippets ONLY when they are clearly the final adopted version.
+   - Replace earlier draft snippets with the final adopted version instead of keeping both.
+   - Prefer exact final function bodies, final config blocks, final merge orders, and final behavioral contracts.
+   - Do NOT preserve exploratory, rejected, partial, or superseded code verbatim.
+6. KEEP VERBATIM SNIPPETS SELECTIVE:
+   - Keep exact snippets only when precision matters for future implementation.
+   - If a code block is large, preserve only the critical final section(s), not the entire file.
+7. IGNORE:
+   - greetings
+   - meta-talk about the AI
+   - transient errors unless they caused a durable design change
+   - media payload details unless operationally relevant
 
 ### OUTPUT:
-Provide ONLY the updated archive text. No conversational filler, no markdown blocks, no "Here is the summary."
+Provide ONLY the updated archive text.
+Do not include conversational filler.
+Do not wrap the answer in markdown fences.
+Do not say "Here is the summary."
 """
-
                 user = None
                 if user_data and user_data.get("id"):
                     user = await asyncio.to_thread(
