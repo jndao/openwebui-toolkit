@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.3-dev.12
+version: 0.0.3-dev.13
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -1285,6 +1285,59 @@ class Filter:
 
                 prompt = f"""
 You are the "Context Architect" responsible for maintaining a conversation's Permanent Archive.
+You receive the current archive and new conversation events. Your task is to produce a single updated archive that replaces the old one entirely.
+
+### ARCHIVE STRUCTURE
+The archive must always contain exactly these five sections in this order. Include every section header even if empty.
+
+## Current State
+Facts, preferences, and active conditions that are true right now.
+Each entry must include a confidence percentage reflecting how certain it is based on the conversation.
+Examples:
+- SearXNG running at s.yawn.dev inside Proxmox LXC (95%)
+- User prefers flexible daily plans over rigid itineraries (85%)
+- Considering autumn for the trip, not yet finalized (60%)
+- Backend uses Valkey, not Redis (95%)
+- User dislikes excessive exposition in writing (90%)
+
+Confidence guidelines:
+- 90–100%: Directly stated, verified, implemented, or clearly demonstrated
+- 70–89%: Strongly implied or consistently indicated but not explicitly confirmed
+- 50–69%: Mentioned, under discussion, or tentatively suggested
+- Below 50%: Do not include. If it is too uncertain, omit it.
+
+Cover all relevant domains — technical, creative, logistical, personal, or any other. Do not limit this section to technical facts only.
+
+## Decisions
+What was chosen and why. State the decision and brief rationale.
+When a new decision supersedes an old one, replace the old entry entirely. Do not keep both.
+Do not accumulate historical decisions — only the current active decisions.
+
+## Resolutions
+Problems, errors, confusions, or contradictions encountered and how they were resolved.
+Replace old resolutions when they become obsolete or irrelevant.
+Omit trivial issues that carry no future value.
+
+## Final Code/Config
+Preserve exact verbatim text ONLY when it represents a clearly adopted final version.
+This includes: code, config, commands, contracts, schemas, regex, merge orders, structural definitions, prompts, or any precise text where exact wording matters.
+Replace earlier versions when a newer final version is adopted. Never keep both.
+If nothing applies, write "(none)".
+Do not include exploratory, rejected, partial, or superseded code.
+
+## Open Items
+Unresolved questions, pending actions, or things still under discussion.
+Remove items once resolved or decided elsewhere in the archive.
+
+### RULES
+1. REPLACE, DON'T APPEND: When new information updates or supersedes existing archive content, replace the old entry. The archive reflects current state, not change history.
+2. NO HALLUCINATION: Only include information directly stated or clearly implied by the conversation. Never invent, infer, or assume facts not supported by the dialogue.
+3. DEDUPLICATE: If the same fact appears in multiple sections, keep it only in the most appropriate section.
+4. BE CONCISE: Use bullet points. Avoid paragraphs. Strip filler words. Every entry should earn its place.
+5. PRESERVE TERMINOLOGY: Use the same terms and naming conventions the user uses. Do not rephrase or standardize terminology the user has deliberately chosen.
+6. BE DOMAIN-AGNOSTIC: The archive applies to any conversation type — technical, creative, planning, personal, or mixed. Apply the same structure and rigor regardless of topic.
+7. TRACK PREFERENCES: Record user preferences wherever they appear — tools, models, workflows, communication style, design taste, workflow habits, or any expressed preference.
+8. OMIT: Greetings, meta-talk about the AI, acknowledgments, pleasantries, and transient small talk. Only include interaction details if they reveal a preference, decision, or materially important context.
 
 ### CURRENT ARCHIVE:
 {old_summary_content or "No existing archive."}
@@ -1292,33 +1345,12 @@ You are the "Context Architect" responsible for maintaining a conversation's Per
 ### NEW EVENTS TO INTEGRATE:
 {pool_text}
 
-### YOUR TASK:
-Integrate the NEW EVENTS into the CURRENT ARCHIVE to create a single, cohesive, and updated summary.
-
-### GUIDELINES:
-1. UPDATE FACTS: If new information contradicts or evolves the archive, update the record accordingly.
-2. CATEGORIZE: Maintain sections for [General Context], [User Preferences], [Technical Decisions], [Final Code/Config], and [Open Issues].
-3. DEDUPLICATE: Do not repeat information already clearly stated in the archive.
-4. BE ATOMIC: Use concise bullet points. Focus on what was decided, what changed, and the current state.
-5. PRESERVE FINAL IMPLEMENTATIONS:
-   - Preserve verbatim code/config/command snippets ONLY when they are clearly the final adopted version.
-   - Replace earlier draft snippets with the final adopted version instead of keeping both.
-   - Prefer exact final function bodies, final config blocks, final merge orders, and final behavioral contracts.
-   - Do NOT preserve exploratory, rejected, partial, or superseded code verbatim.
-6. KEEP VERBATIM SNIPPETS SELECTIVE:
-   - Keep exact snippets only when precision matters for future implementation.
-   - If a code block is large, preserve only the critical final section(s), not the entire file.
-7. IGNORE:
-   - greetings
-   - meta-talk about the AI
-   - transient errors unless they caused a durable design change
-   - media payload details unless operationally relevant
-
 ### OUTPUT:
 Provide ONLY the updated archive text.
 Do not include conversational filler.
-Do not wrap the answer in markdown fences.
-Do not say "Here is the summary."
+Do not wrap in markdown fences.
+Do not say "Here is the summary" or similar.
+Start directly with "## Current State".
 """
                 user = None
                 if user_data and user_data.get("id"):
