@@ -452,18 +452,43 @@ class ContextReconstructor:
 
 class Filter:
     class Valves(BaseModel):
-        emit_status_events: int = Field(default=True, description="Toggle whether to show user's token usage statistics")
-        compression_threshold_tokens: int = Field(default=30000)
-        max_context_tokens: int = Field(default=120000)
-        keep_start_messages: int = Field(default=0)
-        keep_last_messages: int = Field(default=10)
-        summary_model: Optional[str] = Field(default=None)
-        include_protected_in_threshold: bool = Field(default=True)
-        tool_trim_threshold: int = Field(default=1000)
+        emit_status_events: int = Field(default=True, description="Toggle whether users should see Context Manager events in OWUI")
+        compression_threshold_tokens: int = Field(
+            default=40000,
+            description="Trigger archival when the 'Compressible' zone exceeds this token count. Higher values keep more history in full detail but increase costs."
+        )
+        max_context_tokens: int = Field(
+            default=120000,
+            description="The hard limit for the model's total context window. If exceeded, the filter will intelligently trim tool outputs to ensure the model can still respond."
+        )
+        keep_start_messages: int = Field(
+            default=0,
+            description="Number of messages at the very beginning of the chat to protect from summarization (useful for persistent system-like instructions or 'rules of the road')."
+        )
+        keep_last_messages: int = Field(
+            default=10,
+            description="Number of recent messages to keep in the 'Protected' zone. These are never summarized, ensuring high-fidelity 'short-term memory' for the current conversation."
+        )
+        summary_model: Optional[str] = Field(
+            default=None,
+            description="The Model ID to use for background summarization. Recommended: A fast, cheap, but intelligent model (e.g., Gemini 1.5 Flash or Llama 3.1 8B) to save costs."
+        )
+        include_protected_in_threshold: bool = Field(
+            default=True,
+            description="If true, Protected messages count toward the compression threshold. If false, only 'Compressible' messages are measured against the threshold."
+        )
+        tool_trim_threshold: int = Field(
+            default=1000,
+            description="Tool outputs or <details> blocks larger than this token count are eligible for 'Smart Trimming' when context pressure is high."
+        )
         protected_tool_trim_mode: str = Field(
-            default="never"
-        )  # never|overflow_only|always
-        debug_logging: bool = Field(default=False)
+            default="never",
+            description="Controls tool trimming in the Protected zone. 'never': Keep all tool data; 'overflow_only': Trim only if context exceeds max_context_tokens; 'always': Always trim large tools."
+        )
+        debug_logging: bool = Field(
+            default=False,
+            description="Enable detailed console logging for troubleshooting token accounting and background compression tasks."
+        )
 
     def __init__(self):
         self.valves = self.Valves()
