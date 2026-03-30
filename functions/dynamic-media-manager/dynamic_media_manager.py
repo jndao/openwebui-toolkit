@@ -12,6 +12,7 @@ Overview:
   Compresses images in chat messages to prevent 413 errors. Applies quality gradient
   (recent images = higher quality, older = lower). Supports PNG→JPEG conversion, vision
   model detection, and OCR-based image descriptions for non-vision models.
+
 Configuration:
   priority: 15 (runs after context compression at 10)
   max_image_size_bytes: 1048576 (1MB) - images above this are compressed
@@ -28,8 +29,8 @@ Configuration:
   enable_smart_drop: true - generate OCR descriptions for dropped images
   description_quality: medium (low/medium/high)
   use_ocr: true - extract text via RapidOCR
-  estimate_image_tokens: true - estimate image token usage after compression
   image_token_detail: auto (auto/low/high)
+
 Requirements: Pillow (PIL) - typically included in Open WebUI
 """
 
@@ -155,7 +156,7 @@ def format_tokens(token_count: int) -> str:
 def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
     """
     Check if a model supports vision capabilities.
-    Checks Explicit capabilities in model["info"]["meta"]["capabilities"]["vision"]
+    Checks explicit capabilities in model["info"]["meta"]["capabilities"]["vision"].
     """
     if not model:
         return True
@@ -247,7 +248,6 @@ def estimate_image_tokens_from_dimensions(
     if detail == "low":
         return 85
 
-    # treat auto as high
     max_dim = max(width, height)
     scale = 1.0
     if max_dim > 2048:
@@ -517,11 +517,6 @@ class Filter:
             description="Use OCR to extract text from images when generating descriptions. Uses RapidOCR (included in Open WebUI dependencies).",
         )
 
-        estimate_image_tokens: bool = Field(
-            default=True,
-            description="Estimate vision token usage for images after compression and include it in status/debug output.",
-        )
-
         image_token_detail: str = Field(
             default="auto",
             description="Token estimation detail level for images. Options: auto, low, high. 'auto' currently uses the high-detail tiling heuristic.",
@@ -647,6 +642,12 @@ class Filter:
             "image_count": total_images,
             "image_tokens": total_tokens,
         }
+
+    def _build_image_token_status(self, image_usage: Dict[str, int]) -> str:
+        """Build final image token usage status string."""
+        image_count = image_usage.get("image_count", 0)
+        image_tokens = image_usage.get("image_tokens", 0)
+        return f"🪙 Image tokens: {format_tokens(image_tokens)} across {image_count} image(s)"
 
     def _process_image_in_message(
         self,
@@ -806,13 +807,6 @@ class Filter:
         if not messages:
             return body
 
-        # Estimate image tokens before modification
-        before_image_usage = (
-            self._calculate_image_token_usage(messages)
-            if self.valves.estimate_image_tokens
-            else {"image_count": 0, "image_tokens": 0}
-        )
-
         if self.valves.enable_vision_detection:
             supports_vision = model_supports_vision(__model__)
             self._log(f"Model vision support: {supports_vision}")
@@ -933,6 +927,8 @@ class Filter:
         total_compressed = 0
         total_saved = 0
         compression_details = []
+
+        after_image_usage = self._calculate_image_token_usage(messages)
 
         image_positions = []
         for msg_idx, message in enumerate(messages):
@@ -1107,34 +1103,22 @@ class Filter:
                     __event_emitter__,
                 )
 
-        # Estimate image token usage after processing
-        after_image_usage = (
-            self._calculate_image_token_usage(body.get("messages", []))
-            if self.valves.estimate_image_tokens
-            else {"image_count": 0, "image_tokens": 0}
-        )
+        final_image_usage = self._calculate_image_token_usage(body.get("messages", []))
 
         if total_compressed > 0:
             self._log(
                 f"Compressed {total_compressed} image(s), saved {format_size(total_saved)}"
             )
 
-            status_msg = f"🖼️ Compressed {total_compressed} image(s) - saved {format_size(total_saved)}"
-            if self.valves.estimate_image_tokens:
-                after_tokens = after_image_usage.get("image_tokens", 0)
-                status_msg += (
-                    f" · {format_tokens(after_tokens)} tokens"
-                )
+            status_msg = (
+                f"🖼️ Compressed {total_compressed} image(s) - saved {format_size(total_saved)}"
+            )
+            status_msg += f" · {self._build_image_token_status(final_image_usage)}"
 
             await self._emit_status(status_msg, __event_emitter__)
 
             await self._emit_debug_log(
-                f"Compressed {total_compressed} image(s), saved {format_size(total_saved)}"
-                + (
-                    f", image tokens: {before_image_usage.get('image_tokens', 0)} -> {after_image_usage.get('image_tokens', 0)}"
-                    if self.valves.estimate_image_tokens
-                    else ""
-                ),
+                f"Compressed {total_compressed} image(s), saved {format_size(total_saved)}, final image tokens: {final_image_usage.get('image_tokens', 0)}",
                 __event_call__,
             )
 
@@ -1149,18 +1133,13 @@ class Filter:
         else:
             self._log(f"No images needed compression (checked {total_images} images)")
             await self._emit_debug_log(
-                f"No compression needed (checked {total_images} images)"
-                + (
-                    f", image tokens: {after_image_usage.get('image_tokens', 0)} across {after_image_usage.get('image_count', 0)} image(s)"
-                    if self.valves.estimate_image_tokens
-                    else ""
-                ),
+                f"No compression needed (checked {total_images} images), final image tokens: {final_image_usage.get('image_tokens', 0)} across {final_image_usage.get('image_count', 0)} image(s)",
                 __event_call__,
             )
 
-            if self.valves.estimate_image_tokens and after_image_usage.get("image_count", 0) > 0:
+            if final_image_usage.get("image_count", 0) > 0:
                 await self._emit_status(
-                    f"🪙 Image tokens: {format_tokens(after_image_usage['image_tokens'])} across {after_image_usage['image_count']} image(s)",
+                    self._build_image_token_status(final_image_usage),
                     __event_emitter__,
                 )
 
@@ -1170,12 +1149,7 @@ class Filter:
         )
 
         await self._emit_debug_log(
-            f"Final payload: {format_size(final_payload_size)}"
-            + (
-                f", estimated image tokens: {after_image_usage.get('image_tokens', 0)}"
-                if self.valves.estimate_image_tokens
-                else ""
-            ),
+            f"Final payload: {format_size(final_payload_size)}, final image tokens: {final_image_usage.get('image_tokens', 0)}",
             __event_call__,
         )
 

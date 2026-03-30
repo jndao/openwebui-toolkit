@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.3-dev.1
+version: 0.0.3-dev.8
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -49,8 +49,10 @@ except ImportError:
     DateTime = None
 
 logger = logging.getLogger(__name__)
+
 SUMMARY_TAG = "context_summary"
 SUMMARY_SOURCE = "context_manager"
+
 TOOL_DETAILS_BLOCK_RE = re.compile(r'<details type="tool_calls"[\s\S]*?</details>')
 TOOL_RESULT_ATTR_RE = re.compile(r'result="([^"]*)"')
 
@@ -80,6 +82,7 @@ if owui_Base is not None and Column is not None:
             if _owui_schema
             else {"extend_existing": True}
         )
+
         id = Column(Integer, primary_key=True, autoincrement=True)
         chat_id = Column(String(255), unique=True, nullable=False)
         summary_content = Column(Text, nullable=False)
@@ -104,14 +107,48 @@ class SummaryState:
 
 @dataclass
 class MessagePools:
-    total_msgs: int
-    protected_start: int
-    protected_end: int
-    tail_start_idx: int
-    start_end_idx: int
-    summary_indices: Set[int]
-    protected_indices: Set[int]
-    compressible_indices: Set[int]
+    """Message pools returned as actual message lists."""
+    protected_start: List[Dict[str, Any]]
+    summarized: List[Dict[str, Any]]
+    compressible: List[Dict[str, Any]]
+    protected_end: List[Dict[str, Any]]
+
+
+@dataclass
+class RuntimeSegments:
+    """Runtime message segments in deterministic merge order."""
+    protected_start: List[Dict[str, Any]]
+    summary_message: Optional[Dict[str, Any]]
+    media_messages: List[Dict[str, Any]]
+    uncompressed: List[Dict[str, Any]]
+    protected_end: List[Dict[str, Any]]
+
+    @property
+    def final_messages(self) -> List[Dict[str, Any]]:
+        """Build final message list in runtime order:
+        protected_start → summary → media → uncompressed → protected_end
+        """
+        merged: List[Dict[str, Any]] = []
+        merged.extend(self.protected_start)
+        if self.summary_message:
+            merged.append(self.summary_message)
+        merged.extend(self.media_messages)
+        merged.extend(self.uncompressed)
+        merged.extend(self.protected_end)
+        return merged
+
+
+@dataclass
+class RuntimeView:
+    """Runtime view with explicit segments and accurate stats."""
+    final_messages: List[Dict[str, Any]]
+    stats_message: str
+    segments: RuntimeSegments
+    total_tokens: int
+    protected_tokens: int
+    uncompressed_tokens: int
+    summary_tokens: int
+    media_tokens: int
 
 
 class SummaryStore:
@@ -232,8 +269,8 @@ class TokenCounter:
     @staticmethod
     def _count_message(msg: Dict[str, Any]) -> int:
         total = 0
-        content = msg.get("content", "")
 
+        content = msg.get("content", "")
         if isinstance(content, str):
             total += TokenCounter._count_text(content)
         elif isinstance(content, dict):
@@ -241,12 +278,45 @@ class TokenCounter:
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict):
-                    if part.get("type") == "text":
-                        total += TokenCounter._count_text(part.get("text", ""))
-                    else:
-                        continue
+                    part_type = str(part.get("type", "")).strip().lower()
+                    if part_type in {"text", "input_text"}:
+                        total += TokenCounter._count_text(
+                            part.get("text", "") or part.get("content", "")
+                        )
                 elif isinstance(part, str):
                     total += TokenCounter._count_text(part)
+
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+
+                tool_call_id = tool_call.get("id")
+                if isinstance(tool_call_id, str):
+                    total += TokenCounter._count_text(tool_call_id)
+
+                tool_call_type = tool_call.get("type")
+                if isinstance(tool_call_type, str):
+                    total += TokenCounter._count_text(tool_call_type)
+
+                function_payload = tool_call.get("function")
+                if isinstance(function_payload, dict):
+                    function_name = function_payload.get("name")
+                    if isinstance(function_name, str):
+                        total += TokenCounter._count_text(function_name)
+
+                    arguments = function_payload.get("arguments")
+                    if isinstance(arguments, str):
+                        total += TokenCounter._count_text(arguments)
+
+        tool_call_id = msg.get("tool_call_id")
+        if isinstance(tool_call_id, str):
+            total += TokenCounter._count_text(tool_call_id)
+
+        name = msg.get("name")
+        if isinstance(name, str):
+            total += TokenCounter._count_text(name)
 
         total += 4
         return total
@@ -289,73 +359,6 @@ class TokenCounter:
 
 class ContextReconstructor:
     @staticmethod
-    def trim_messages(
-        messages: List[Dict[str, Any]],
-        max_tokens: int,
-        keep_start_messages: int = 0,
-        keep_last_messages: int = 4,
-    ) -> List[Dict[str, Any]]:
-        if not messages:
-            return messages
-        total_tokens = sum(
-            TokenCounter.count(m)
-            for m in messages
-            if not Filter._static_message_has_passthrough_media(m)
-        )
-        if total_tokens <= max_tokens:
-            return messages
-        if keep_last_messages >= len(messages):
-            return messages
-        front_messages = (
-            messages[:keep_start_messages] if keep_start_messages > 0 else []
-        )
-        front_tokens = sum(
-            TokenCounter.count(m)
-            for m in front_messages
-            if not Filter._static_message_has_passthrough_media(m)
-        )
-        tail_messages = messages[-keep_last_messages:] if keep_last_messages > 0 else []
-        tail_tokens = sum(
-            TokenCounter.count(m)
-            for m in tail_messages
-            if not Filter._static_message_has_passthrough_media(m)
-        )
-        remaining_budget = max_tokens - front_tokens - tail_tokens
-        if remaining_budget <= 0:
-            return front_messages + tail_messages
-        middle_messages = messages[
-            keep_start_messages : len(messages) - keep_last_messages
-        ]
-        added = []
-        added_tokens = 0
-        for msg in middle_messages:
-            msg_tokens = (
-                0
-                if Filter._static_message_has_passthrough_media(msg)
-                else TokenCounter.count(msg)
-            )
-            if added_tokens + msg_tokens <= remaining_budget:
-                added.append(msg)
-                added_tokens += msg_tokens
-            else:
-                break
-        return front_messages + added + tail_messages
-
-    def safe_hard_limit(
-        self,
-        messages: List[Dict[str, Any]],
-        max_tokens: int,
-        keep_start_messages: int = 0,
-        keep_last_messages: int = 4,
-    ) -> List[Dict[str, Any]]:
-        return self.trim_messages(
-            messages,
-            max_tokens,
-            keep_start_messages=keep_start_messages,
-            keep_last_messages=keep_last_messages,
-        )
-
-    @staticmethod
     def collapsed_tool_text() -> str:
         return "[TOOL OUTPUT COLLAPSED]"
 
@@ -374,6 +377,7 @@ class ContextReconstructor:
 
     def normalize_tool_call_ids(self, messages: List[Dict[str, Any]]) -> int:
         rewritten_ids: Dict[str, str] = {}
+
         for message in messages:
             tool_calls = message.get("tool_calls")
             if not isinstance(tool_calls, list):
@@ -391,8 +395,10 @@ class ContextReconstructor:
                     normalized_id = self._shorten_tool_call_id(original_id)
                     rewritten_ids[original_id] = normalized_id
                 tool_call["id"] = normalized_id
+
         if not rewritten_ids:
             return 0
+
         for message in messages:
             tool_call_id = message.get("tool_call_id")
             if not isinstance(tool_call_id, str):
@@ -400,6 +406,7 @@ class ContextReconstructor:
             normalized_id = rewritten_ids.get(tool_call_id)
             if normalized_id and normalized_id != tool_call_id:
                 message["tool_call_id"] = normalized_id
+
         return sum(1 for old_id, new_id in rewritten_ids.items() if old_id != new_id)
 
     def trim_tool_content(
@@ -413,29 +420,49 @@ class ContextReconstructor:
             "trimmed_count": 0,
             "chars_removed": 0,
             "tool_messages_trimmed": 0,
+            "tool_arguments_trimmed": 0,
             "detail_blocks_trimmed": 0,
             "tool_call_ids_normalized": 0,
         }
+
         stats["tool_call_ids_normalized"] = self.normalize_tool_call_ids(trimmed)
         collapsed_text = self.collapsed_tool_text()
+
         for i, msg_copy in enumerate(trimmed):
             if target_indices is not None and i not in target_indices:
                 continue
-            role = msg_copy.get("role")
-            if role == "tool":
+
+            if msg_copy.get("role") == "tool":
                 content = msg_copy.get("content")
                 content_text = TokenCounter.extract_text(content)
-                if content_text and len(content_text) > threshold:
+                if content_text and TokenCounter._count_text(content_text) > threshold:
                     removed = max(0, len(content_text) - len(collapsed_text))
                     msg_copy["content"] = collapsed_text
                     stats["trimmed_count"] += 1
                     stats["tool_messages_trimmed"] += 1
                     stats["chars_removed"] += removed
+
+            tool_calls = msg_copy.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function_payload = tool_call.get("function")
+                    if not isinstance(function_payload, dict):
+                        continue
+                    arguments = function_payload.get("arguments")
+                    if (
+                        isinstance(arguments, str)
+                        and TokenCounter._count_text(arguments) > threshold
+                    ):
+                        removed = max(0, len(arguments) - len(collapsed_text))
+                        function_payload["arguments"] = collapsed_text
+                        stats["trimmed_count"] += 1
+                        stats["tool_arguments_trimmed"] += 1
+                        stats["chars_removed"] += removed
+
             content = msg_copy.get("content")
-            if (
-                not isinstance(content, str)
-                or '<details type="tool_calls"' not in content
-            ):
+            if not isinstance(content, str) or '<details type="tool_calls"' not in content:
                 continue
 
             def _replace_tool_result(match: re.Match) -> str:
@@ -444,7 +471,7 @@ class ContextReconstructor:
                 if not result_match:
                     return block
                 result_payload = result_match.group(1)
-                if len(result_payload) <= threshold:
+                if TokenCounter._count_text(result_payload) <= threshold:
                     return block
                 removed = max(0, len(result_payload) - len(collapsed_text))
                 stats["trimmed_count"] += 1
@@ -456,29 +483,12 @@ class ContextReconstructor:
                     count=1,
                 )
 
-            msg_copy["content"] = TOOL_DETAILS_BLOCK_RE.sub(
-                _replace_tool_result, content
-            )
+            msg_copy["content"] = TOOL_DETAILS_BLOCK_RE.sub(_replace_tool_result, content)
+
         return trimmed, stats
 
 
 class Filter:
-    @staticmethod
-    def _static_message_has_passthrough_media(message: Dict[str, Any]) -> bool:
-        if not isinstance(message, dict):
-            return False
-        content = message.get("content")
-        media_types = {"image_url", "file", "input_image", "input_file"}
-        if isinstance(content, dict):
-            return str(content.get("type", "")).strip().lower() in media_types
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if str(part.get("type", "")).strip().lower() in media_types:
-                    return True
-        return False
-
     class Valves(BaseModel):
         emit_status_events: bool = Field(
             default=True,
@@ -486,39 +496,35 @@ class Filter:
         )
         compression_threshold_tokens: int = Field(
             default=40000,
-            description="Trigger archival when the 'Compressible' zone exceeds this token count. Higher values keep more history in full detail but increase costs.",
+            description="Trigger archival when the compressible zone exceeds this token count.",
         )
         max_context_tokens: int = Field(
             default=120000,
-            description="The hard limit for the model's total context window. If exceeded, the filter will intelligently trim tool outputs to ensure the model can still respond.",
+            description="Hard limit for the model context window.",
         )
         keep_start_messages: int = Field(
             default=0,
-            description="Number of messages at the very beginning of the chat to protect from summarization (useful for persistent system-like instructions or 'rules of the road').",
+            description="Number of messages at the start of the chat to protect.",
         )
         keep_last_messages: int = Field(
             default=10,
-            description="Number of recent messages to keep in the 'Protected' zone. These are never summarized, ensuring high-fidelity short-term memory for the current conversation.",
+            description="Number of recent messages to protect at the end of the chat.",
         )
         summary_model: Optional[str] = Field(
             default=None,
-            description="The Model ID to use for background summarization. Recommended: A fast, cheap, but intelligent model to save costs.",
+            description="Model ID to use for background summarization.",
         )
         include_protected_in_threshold: bool = Field(
             default=True,
-            description="If true, Protected messages count toward the compression threshold. If false, only 'Compressible' messages are measured against the threshold.",
+            description="If true, protected messages count toward the compression threshold.",
         )
         tool_trim_threshold: int = Field(
             default=1000,
-            description="Tool outputs or <details> blocks larger than this token count are eligible for Smart Trimming when context pressure is high.",
-        )
-        protected_tool_trim_mode: str = Field(
-            default="never",
-            description="Controls tool trimming in the Protected zone. 'never': Keep all tool data; 'overflow_only': Trim only if context exceeds max_context_tokens; 'always': Always trim large tools.",
+            description="Tool outputs, tool-call arguments, or <details> result blocks larger than this token count are eligible for trimming.",
         )
         debug_logging: bool = Field(
             default=False,
-            description="Enable detailed console logging for troubleshooting token accounting and background compression tasks.",
+            description="Enable detailed console logging.",
         )
 
     def __init__(self):
@@ -543,93 +549,75 @@ class Filter:
         except Exception as e:
             logger.debug(f"[Status Emit] Failed: {e}")
 
+    def _normalize_epoch_timestamp(self, value: Any) -> Optional[int]:
+        try:
+            if isinstance(value, datetime):
+                return int(value.timestamp())
+
+            if isinstance(value, str):
+                raw = value.strip()
+                if not raw:
+                    return None
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    try:
+                        return int(
+                            datetime.fromisoformat(
+                                raw.replace("Z", "+00:00")
+                            ).timestamp()
+                        )
+                    except Exception:
+                        return None
+
+            if isinstance(value, (int, float)):
+                numeric = float(value)
+                if numeric <= 0:
+                    return None
+
+                if numeric > 1e18:
+                    numeric /= 1_000_000_000
+                elif numeric > 1e15:
+                    numeric /= 1_000_000
+                elif numeric > 1e12:
+                    numeric /= 1000
+
+                ts = int(numeric)
+                return ts
+        except Exception:
+            return None
+
+        return None
+
     def _timestamp_of(self, msg: Dict[str, Any]) -> Optional[int]:
         if not isinstance(msg, dict):
             return None
         msg_ts = msg.get("timestamp")
         if msg_ts is None:
             msg_ts = msg.get("created_at")
-        if msg_ts is None:
-            return None
-        if isinstance(msg_ts, datetime):
-            try:
-                return int(msg_ts.timestamp())
-            except Exception:
-                return None
-        if isinstance(msg_ts, (int, float)):
-            return int(msg_ts)
-        if isinstance(msg_ts, str):
-            raw = msg_ts.strip()
-            if not raw:
-                return None
-            try:
-                return int(float(raw))
-            except (TypeError, ValueError):
-                pass
-            try:
-                return int(
-                    datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-                )
-            except Exception:
-                return None
-        return None
-
-    def _message_has_passthrough_media(self, message: Dict[str, Any]) -> bool:
-        return self._static_message_has_passthrough_media(message)
-
-    def _message_tokens(self, messages: List[Dict[str, Any]], indices: Set[int]) -> int:
-        total = 0
-        for i in indices:
-            if not (0 <= i < len(messages)):
-                continue
-            if self._message_has_passthrough_media(messages[i]):
-                continue
-            total += TokenCounter.count(messages[i])
-        return total
-
-    def _content_signature(self, content: Any) -> str:
-        if isinstance(content, str):
-            return f"str:{content[:200]}"
-        if isinstance(content, dict):
-            return f"dict:{content.get('type', '')}:{TokenCounter.extract_text(content)[:120]}"
-        if isinstance(content, list):
-            parts = []
-            for part in content[:8]:
-                if isinstance(part, dict):
-                    parts.append(str(part.get("type", "dict")))
-                else:
-                    parts.append(type(part).__name__)
-            text = TokenCounter.extract_text(content)[:120]
-            return f"list:{'|'.join(parts)}:{text}"
-        return type(content).__name__
+        return self._normalize_epoch_timestamp(msg_ts)
 
     def _message_identity(self, msg: Dict[str, Any]) -> str:
         if not isinstance(msg, dict):
             return ""
+
         for key in ("id", "message_id", "uuid"):
             value = msg.get(key)
             if value is not None:
                 value_str = str(value).strip()
                 if value_str:
                     return f"id:{value_str}"
+
         role = str(msg.get("role", ""))
         ts = self._timestamp_of(msg)
-        sig = self._content_signature(msg.get("content", ""))
-        return f"fallback:{role}:{ts}:{sig}"
+        content = TokenCounter.extract_text(msg.get("content", ""))
+        return f"fallback:{role}:{ts}:{content[:200]}"
 
-    def _clean_message_history(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        if not messages:
-            return []
-        filtered = list(messages)
-        if filtered and not filtered[-1].get("content"):
-            filtered = filtered[:-1]
-        return filtered
 
     def _unfold_messages(self, messages: Any) -> List[Dict[str, Any]]:
         if not messages:
             return []
+
         result = []
         for msg in messages:
             if not isinstance(msg, dict):
@@ -648,86 +636,74 @@ class Filter:
                 result.append(msg)
         return result
 
-    def _normalize_messages(
+    # Fields to keep for LLM context (scrub everything else)
+    KEEP_FIELDS = frozenset({
+        "id", "parentId", "role", "content", "timestamp"
+    })
+
+    def _scrub_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove unnecessary fields from a message, keeping only essential fields."""
+        if not isinstance(msg, dict):
+            return {}
+        return {k: v for k, v in msg.items() if k in self.KEEP_FIELDS}
+
+    def _prepare_db_messages(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        normalized = self._unfold_messages(messages)
-        deduped: List[Dict[str, Any]] = []
+        """
+        Prepare DB messages for LLM context.
+        
+        - Unfolds children structure
+        - Deduplicates by identity
+        - Preserves original order (no timestamp sorting)
+        - Scrubs unnecessary fields
+        """
+        if not messages:
+            return []
+        # Step 1: Unfold children structure
+        unfolded = self._unfold_messages(messages)
+        
+        # Step 2: Remove any empty messages
+        cleaned = [x for x in unfolded if x['content']]
+        
+        # Step 4: Scrub unnecessary fields
+        return [self._scrub_message(msg) for msg in cleaned]
+
+    def _load_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        return self._prepare_db_messages(
+            self._load_db_messages_by_chat_id(chat_id)
+        )
+
+    def _extract_media_messages_from_body(self, body: dict) -> List[Dict[str, Any]]:
+        """Extract media messages from body without normalization.
+        
+        Body messages are already in correct order - just filter and dedupe.
+        No need to normalize or scrub - preserve original structure.
+        """
+        if not isinstance(body, dict):
+            return []
+
+        body_messages = body.get("messages")
+        if not isinstance(body_messages, list):
+            return []
+
+        media_messages: List[Dict[str, Any]] = []
         seen = set()
-        for msg in normalized:
+
+        for msg in body_messages:
+            if not isinstance(msg, dict):
+                continue
+            if not self._message_has_passthrough_media(msg):
+                continue
             identity = self._message_identity(msg)
             if identity and identity in seen:
                 continue
             if identity:
                 seen.add(identity)
-            deduped.append(msg)
-        indexed = list(enumerate(deduped))
-        indexed.sort(
-            key=lambda item: (
-                self._timestamp_of(item[1]) is None,
-                (
-                    self._timestamp_of(item[1])
-                    if self._timestamp_of(item[1]) is not None
-                    else 0
-                ),
-                item[0],
-            )
-        )
-        return [msg for _, msg in indexed]
+            media_messages.append(deepcopy(msg))
 
-    def _load_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
-        return self._normalize_messages(
-            self._clean_message_history(self._load_db_messages_by_chat_id(chat_id))
-        )
-
-    def _merge_body_last_message(
-        self, messages: List[Dict[str, Any]], body: dict
-    ) -> List[Dict[str, Any]]:
-        merged = list(messages)
-        if not isinstance(body, dict):
-            return merged
-        body_messages = body.get("messages")
-        if not isinstance(body_messages, list) or not body_messages:
-            return merged
-        candidate = body_messages[-1]
-        if not isinstance(candidate, dict):
-            return merged
-        candidate_identity = self._message_identity(candidate)
-        if candidate_identity and any(
-            self._message_identity(msg) == candidate_identity for msg in merged
-        ):
-            return merged
-        merged.append(deepcopy(candidate))
-        return merged
-
-    def _merge_body_messages(
-        self, messages: List[Dict[str, Any]], body: dict
-    ) -> List[Dict[str, Any]]:
-        merged = [deepcopy(msg) for msg in messages]
-        if not isinstance(body, dict):
-            return merged
-        body_messages = body.get("messages")
-        if not isinstance(body_messages, list) or not body_messages:
-            return merged
-
-        index_by_identity: Dict[str, int] = {}
-        for i, msg in enumerate(merged):
-            identity = self._message_identity(msg)
-            if identity:
-                index_by_identity[identity] = i
-
-        for candidate in body_messages:
-            if not isinstance(candidate, dict):
-                continue
-            candidate_copy = deepcopy(candidate)
-            identity = self._message_identity(candidate_copy)
-            if identity and identity in index_by_identity:
-                merged[index_by_identity[identity]] = candidate_copy
-            else:
-                merged.append(candidate_copy)
-                if identity:
-                    index_by_identity[identity] = len(merged) - 1
-        return merged
+        # Return as-is - no normalization, no scrubbing
+        return media_messages
 
     def _get_summary_state(self, chat_id: str) -> SummaryState:
         summary_data = get_summary_from_store(chat_id)
@@ -739,335 +715,345 @@ class Filter:
             raw=summary_data,
         )
 
+    def _build_summary_message(
+        self, summary_state: SummaryState
+    ) -> Optional[Dict[str, Any]]:
+        """Build the summary message to inject into the runtime payload."""
+        if not summary_state or not summary_state.content:
+            return None
+
+        return {
+            "role": "system",
+            "content": f"<{SUMMARY_TAG}>\n{summary_state.content}\n</{SUMMARY_TAG}>",
+        }
+
+    def _count_tokens_in_messages(self, messages: List[Dict[str, Any]]) -> int:
+        """Count total tokens in a list of messages."""
+        if not messages:
+            return 0
+        return sum(
+            TokenCounter.count(msg)
+            for msg in messages
+            if isinstance(msg, dict)
+        )
+
+    def _format_token_count(self, n: int) -> str:
+        """Format token count for display."""
+        if n >= 1000:
+            return f"{n / 1000:.1f}k"
+        return str(int(n))
+
+    def _build_runtime_stats_message(
+        self,
+        summarized_messages: List[Dict[str, Any]],
+        protected_messages: List[Dict[str, Any]],
+        summary_message: Optional[Dict[str, Any]],
+        uncompressed_messages: List[Dict[str, Any]],
+        media_messages: List[Dict[str, Any]],
+    ) -> Tuple[str, int, int, int, int, int]:
+        """Build runtime stats message from explicit segments.
+        
+        Returns tuple of (stats_message, total_tokens, protected_tokens,
+                         uncompressed_tokens, summary_tokens, media_tokens)
+        """
+        protected_count = len(protected_messages)
+        uncompressed_count = len(uncompressed_messages)
+
+        protected_tokens = self._count_tokens_in_messages(protected_messages)
+        summarized_tokens = self._count_tokens_in_messages(summarized_messages)
+        summary_tokens = (
+            self._count_tokens_in_messages([summary_message])
+            if summary_message else 0
+        )
+        uncompressed_tokens = self._count_tokens_in_messages(uncompressed_messages)
+        media_tokens = self._count_tokens_in_messages(media_messages)
+
+        total_tokens = (
+            protected_tokens
+            + summary_tokens
+            + uncompressed_tokens
+            + media_tokens
+        )
+
+        stats = (
+            f"✅🪙 {self._format_token_count(total_tokens)} │ "
+            f"🛡️ {self._format_token_count(protected_tokens)} ({protected_count}) · "
+            f"⏳ {self._format_token_count(uncompressed_tokens)} ({uncompressed_count}) · "
+            f"📦 {self._format_token_count(summary_tokens)} ({len(summarized_messages)}{ f" @ {round((summarized_tokens - summary_tokens)/summarized_tokens * 100, 2)}%" if summary_tokens > 0 else ""})"
+        )
+
+        return (
+            stats,
+            total_tokens,
+            protected_tokens,
+            uncompressed_tokens,
+            summary_tokens,
+            media_tokens,
+        )
+
     def _split_message_pools(
         self,
         messages: List[Dict[str, Any]],
         summary_time: Optional[int],
-        protected_start: int,
-        protected_end: int,
+        keep_start: int,
+        keep_end: int,
     ) -> MessagePools:
-        total_msgs = len(messages)
-        protected_start = max(0, min(protected_start, total_msgs))
-        protected_end = max(0, min(protected_end, total_msgs))
-        start_end_idx = protected_start
-        tail_start_idx = max(0, total_msgs - protected_end)
-        protected_indices = set(range(start_end_idx))
-        protected_indices.update(range(tail_start_idx, total_msgs))
-        media_indices = {
-            i
-            for i, msg in enumerate(messages)
-            if self._message_has_passthrough_media(msg)
-        }
-        protected_indices.update(media_indices)
-        summary_indices = set()
-        if summary_time is not None:
-            for i, msg in enumerate(messages):
-                if i in media_indices:
-                    continue
-                msg_ts = self._timestamp_of(msg)
-                if msg_ts is not None and msg_ts <= summary_time:
-                    summary_indices.add(i)
-        summary_indices -= protected_indices
-        compressible_start = min(start_end_idx, tail_start_idx)
-        compressible_end = max(start_end_idx, tail_start_idx)
-        compressible_indices = (
-            set(range(compressible_start, compressible_end))
-            - summary_indices
-            - protected_indices
-            - media_indices
-        )
+        """Split messages into pools as actual message lists.
+        
+        Returns:
+            MessagePools with:
+            - protected_start: Always preserved start messages
+            - summarized: Messages covered by summary (excluded from payload)
+            - compressible: Live unsummarized middle (uncompressed in payload)
+            - protected_end: Always preserved end messages
+        """
+        total = len(messages)
+
+        start_cut = min(max(keep_start, 0), total)
+        end_count = min(max(keep_end, 0), max(0, total - start_cut))
+        end_start = total - end_count
+
+        protected_start = list(messages[:start_cut])
+        protected_end = list(messages[end_start:]) if end_count > 0 else []
+
+        middle = list(messages[start_cut:end_start])
+
+        summarized: List[Dict[str, Any]] = []
+        compressible: List[Dict[str, Any]] = []
+
+        for msg in middle:
+            ts = self._timestamp_of(msg)
+            if summary_time is not None and ts is not None and ts <= summary_time:
+                summarized.append(msg)
+            else:
+                compressible.append(msg)
+
         return MessagePools(
-            total_msgs=total_msgs,
             protected_start=protected_start,
+            summarized=summarized,
+            compressible=compressible,
             protected_end=protected_end,
-            tail_start_idx=tail_start_idx,
-            start_end_idx=start_end_idx,
-            summary_indices=summary_indices,
-            protected_indices=protected_indices,
-            compressible_indices=compressible_indices,
         )
 
-    def _debug_pool_snapshot(
+    def _message_has_passthrough_media(self, message: Dict[str, Any]) -> bool:
+        if not isinstance(message, dict):
+            return False
+
+        content = message.get("content")
+        media_types = {"image_url", "file", "input_image", "input_file"}
+
+        if isinstance(content, dict):
+            return str(content.get("type", "")).strip().lower() in media_types
+
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if str(part.get("type", "")).strip().lower() in media_types:
+                    return True
+
+        return False
+
+    def _build_text_only_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(message, dict):
+            return None
+
+        text_content = TokenCounter.extract_text(message.get("content", ""))
+        if not text_content:
+            return None
+
+        text_message = {
+            "role": message.get("role", "user"),
+            "content": text_content,
+        }
+
+        for key in ("timestamp", "created_at", "id", "message_id", "uuid"):
+            if key in message:
+                text_message[key] = message[key]
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            text_tool_calls = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_call_copy = deepcopy(tool_call)
+                text_tool_calls.append(tool_call_copy)
+            if text_tool_calls:
+                text_message["tool_calls"] = text_tool_calls
+
+        if "tool_call_id" in message:
+            text_message["tool_call_id"] = message["tool_call_id"]
+        if "name" in message:
+            text_message["name"] = message["name"]
+
+        return text_message
+
+    def _build_text_only_messages(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        text_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            text_msg = self._build_text_only_message(msg)
+            if text_msg is not None:
+                text_messages.append(text_msg)
+        return text_messages
+
+    def _package_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        packaged: List[Dict[str, Any]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            msg_copy = deepcopy(msg)
+            msg_copy.pop("children", None)
+            packaged.append(msg_copy)
+        return packaged
+
+    def _build_runtime_view(
+        self,
+        db_messages: List[Dict[str, Any]],
+        media_messages: List[Dict[str, Any]],
+        summary_state: SummaryState,
+    ) -> RuntimeView:
+        """Build the runtime message view using deterministic segments.
+        
+        Runtime merge order:
+        1. protected_start
+        2. summary
+        3. media
+        4. uncompressed (compressible)
+        5. protected_end
+        """
+        message_count = len(db_messages)
+        keep_start = min(self.valves.keep_start_messages, message_count)
+        keep_end = min(
+            self.valves.keep_last_messages,
+            max(0, message_count - keep_start)
+        )
+
+        # Use the new v2 pools that returns message lists
+        pools = self._split_message_pools(
+            db_messages,
+            summary_state.until_ts,
+            keep_start,
+            keep_end,
+        )
+
+        # Apply tool trimming to the compressible (uncompressed) messages
+        trim_targets = set(range(len(pools.compressible)))
+        trimmed_compressible, trim_stats = self.reconstructor.trim_tool_content(
+            pools.compressible,
+            self.valves.tool_trim_threshold,
+            target_indices=trim_targets,
+        )
+
+        # Package the segments
+        protected_start = self._package_messages(pools.protected_start)
+        protected_end = self._package_messages(pools.protected_end)
+        uncompressed = self._package_messages(trimmed_compressible)
+
+        # Build summary message
+        summary_message = self._build_summary_message(summary_state)
+
+        # Build segments
+        segments = RuntimeSegments(
+            protected_start=protected_start,
+            summary_message=summary_message,
+            media_messages=media_messages,
+            uncompressed=uncompressed,
+            protected_end=protected_end,
+        )
+
+        # Build stats from explicit segments
+        protected_all = protected_start + protected_end
+
+        (
+            stats_message,
+            total_tokens,
+            protected_tokens,
+            uncompressed_tokens,
+            summary_tokens,
+            media_tokens,
+        ) = self._build_runtime_stats_message(
+            summarized_messages=pools.summarized,
+            protected_messages=protected_all,
+            summary_message=summary_message,
+            uncompressed_messages=uncompressed,
+            media_messages=media_messages,
+        )
+
+        return RuntimeView(
+            final_messages=segments.final_messages,
+            stats_message=stats_message,
+            segments=segments,
+            total_tokens=total_tokens,
+            protected_tokens=protected_tokens,
+            uncompressed_tokens=uncompressed_tokens,
+            summary_tokens=summary_tokens,
+            media_tokens=media_tokens,
+        )
+
+    def _debug_runtime_view(
         self,
         chat_id: str,
-        messages: List[Dict[str, Any]],
-        pools: MessagePools,
-        summary_time: Optional[int],
         label: str,
+        view: RuntimeView,
+        summary_state: SummaryState,
     ):
         if not self.valves.debug_logging:
             return
         try:
-            compressible_indices = sorted(pools.compressible_indices)
-            summary_indices = sorted(pools.summary_indices)
-            protected_indices = sorted(pools.protected_indices)
             logger.debug(
-                "[Context Manager][%s][%s] total=%s summary_time=%s summary=%s/%s(%s tok) compressible=%s(%s tok) protected=%s(%s tok)",
+                "[Context Manager][%s][%s] total=%s protected=%s uncompressed=%s summary=%s media=%s final=%s summary_until=%s",
                 label,
                 chat_id,
-                len(messages),
-                summary_time,
-                len(summary_indices),
-                len(messages),
-                self._message_tokens(messages, set(summary_indices)),
-                len(compressible_indices),
-                self._message_tokens(messages, set(compressible_indices)),
-                len(protected_indices),
-                self._message_tokens(messages, set(protected_indices)),
+                view.total_tokens,
+                view.protected_tokens,
+                view.uncompressed_tokens,
+                view.summary_tokens,
+                view.media_tokens,
+                len(view.final_messages),
+                summary_state.until_ts,
             )
         except Exception as exc:
-            logger.debug(f"[Context Manager][debug] snapshot failed: {exc}")
+            logger.debug(f"[Context Manager][debug] runtime view failed: {exc}")
 
-    def _build_stats_message(
-        self,
-        messages: List[Dict[str, Any]],
-        summary_content: Optional[str],
-        until_ts: Optional[int],
-    ) -> str:
-        return self._generate_stats_event(
-            messages=messages,
-            summary=summary_content,
-            summary_time=until_ts,
-            protected_start=self.valves.keep_start_messages,
-            protected_end=self.valves.keep_last_messages,
-        )
-
-    def _generate_stats_event(
-        self,
-        messages: List[Dict[str, Any]],
-        summary: Optional[str] = None,
-        summary_time: Optional[int] = None,
-        protected_start: int = 0,
-        protected_end: int = 0,
-    ) -> str:
-        if not messages:
-            return "🪙 0 │ 🛡️ 0 (0) · ⏳ 0 (0) · 📦 0 (0)"
-        pools = self._split_message_pools(
-            messages, summary_time, protected_start, protected_end
-        )
-        summary_tokens = TokenCounter.count(summary) if summary else 0
-        summarised_msgs = len(pools.summary_indices)
-        summarised_tokens = self._message_tokens(messages, pools.summary_indices)
-        protected_msgs = len(pools.protected_indices)
-        protected_tokens = self._message_tokens(messages, pools.protected_indices)
-        compressible_msgs = len(pools.compressible_indices)
-        compressible_tokens = self._message_tokens(messages, pools.compressible_indices)
-
-        def fmt(n: int) -> str:
-            if n >= 1000:
-                return f"{n/1000:.1f}k"
-            return str(int(n))
-
-        efficiency_part = ""
-        if summarised_tokens > 0 and summary:
-            efficiency = (1 - (summary_tokens / summarised_tokens)) * 100
-            efficiency_part = f" @ {round(efficiency, 1)}%"
-        projected_tokens = summary_tokens + protected_tokens + compressible_tokens
-        return (
-            f"🪙 {fmt(projected_tokens)} │ "
-            f"🛡️ {fmt(protected_tokens)} ({protected_msgs}) · "
-            f"⏳ {fmt(compressible_tokens)} ({compressible_msgs}) · "
-            f"📦 {fmt(summary_tokens)} ({summarised_msgs}{efficiency_part})"
-        )
-
-    def _is_message_after_timestamp(
-        self, message: Dict[str, Any], timestamp: int
-    ) -> bool:
-        msg_ts = self._timestamp_of(message)
-        if msg_ts is None:
-            content = message.get("content") if isinstance(message, dict) else None
-            if isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    part_type = str(part.get("type", "")).strip().lower()
-                    if part_type in {"image_url", "file", "input_image", "input_file"}:
-                        return True
-            elif isinstance(content, dict):
-                part_type = str(content.get("type", "")).strip().lower()
-                if part_type in {"image_url", "file", "input_image", "input_file"}:
-                    return True
-            # Messages without timestamps are typically current in-flight request messages.
-            return True
-        return msg_ts > timestamp
-
-    def _trim_message_content(
-        self, messages: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-        if self.valves.tool_trim_threshold > 0:
-            return self.reconstructor.trim_tool_content(
-                messages,
-                self.valves.tool_trim_threshold,
-            )
-        return list(messages), {"trimmed_count": 0, "chars_removed": 0}
-
-    def _normalize_trim_mode(self) -> str:
-        raw = str(self.valves.protected_tool_trim_mode or "never").strip().lower()
-        if raw not in {"never", "overflow_only", "always"}:
-            return "never"
-        return raw
-
-    def _should_trim_protected_for_inlet(
-        self,
-        messages: List[Dict[str, Any]],
-        summary_state: SummaryState,
-    ) -> bool:
-        mode = self._normalize_trim_mode()
-        if mode == "never":
-            return False
-        if mode == "always":
-            return True
-        projected_tokens = sum(
-            TokenCounter.count(m)
-            for m in messages
-            if not self._message_has_passthrough_media(m)
-        )
-        if summary_state.raw:
-            pools = self._split_message_pools(
-                messages,
-                summary_state.until_ts,
-                self.valves.keep_start_messages,
-                self.valves.keep_last_messages,
-            )
-            summary_tokens = TokenCounter.count(summary_state.content)
-            summarised_tokens = self._message_tokens(messages, pools.summary_indices)
-            projected_tokens = projected_tokens - summarised_tokens + summary_tokens
-        return projected_tokens > self.valves.max_context_tokens
-
-    def _build_inlet_trim_targets(
-        self,
-        messages: List[Dict[str, Any]],
-        summary_state: SummaryState,
-        pools: MessagePools,
-    ) -> Tuple[Set[int], bool]:
-        target_indices = set(pools.compressible_indices)
-        trim_protected = self._should_trim_protected_for_inlet(messages, summary_state)
-        if trim_protected:
-            target_indices.update(pools.protected_indices)
-        return target_indices, trim_protected
-
-    def _build_inlet_messages(
+    def _get_compressible_text_messages(
         self,
         db_messages: List[Dict[str, Any]],
         summary_state: SummaryState,
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-        pools = self._split_message_pools(
-            db_messages,
-            summary_state.until_ts,
-            self.valves.keep_start_messages,
-            self.valves.keep_last_messages,
-        )
-        target_indices, trim_protected = self._build_inlet_trim_targets(
-            db_messages, summary_state, pools
-        )
-        target_indices = {
-            i
-            for i in target_indices
-            if 0 <= i < len(db_messages)
-            and not self._message_has_passthrough_media(db_messages[i])
-        }
-        trimmed_messages, trim_stats = self.reconstructor.trim_tool_content(
-            db_messages,
-            self.valves.tool_trim_threshold,
-            target_indices=target_indices,
-        )
-        trim_stats["protected_trim_applied"] = 1 if trim_protected else 0
-        if summary_state.raw:
-            summary_msg = {
-                "role": "system",
-                "content": f"<{SUMMARY_TAG}>\n{summary_state.content}\n</{SUMMARY_TAG}>",
-            }
-            active_messages = [summary_msg]
-            if summary_state.until_ts is not None:
-                for msg in trimmed_messages:
-                    if self._message_has_passthrough_media(
-                        msg
-                    ) or self._is_message_after_timestamp(msg, summary_state.until_ts):
-                        active_messages.append(msg)
-            else:
-                active_messages.extend(trimmed_messages)
-        else:
-            active_messages = trimmed_messages
-        active_messages = self._normalize_messages(active_messages)
-        return active_messages, trim_stats
-
-    def _compression_metrics(
-        self,
-        messages: List[Dict[str, Any]],
-        pools: MessagePools,
-    ) -> Tuple[int, int]:
-        compressible_tokens = self._message_tokens(messages, pools.compressible_indices)
-        protected_tokens = self._message_tokens(messages, pools.protected_indices)
-        threshold_tokens = (
-            compressible_tokens + protected_tokens
-            if self.valves.include_protected_in_threshold
-            else compressible_tokens
-        )
-        return compressible_tokens, threshold_tokens
-
-    def _build_canonical_raw_messages(self, chat_id: str) -> List[Dict[str, Any]]:
-        return self._load_chat_messages(chat_id)
-
-    def _build_active_request_messages(
-        self,
-        chat_id: str,
-        body: dict,
     ) -> List[Dict[str, Any]]:
-        return self._normalize_messages(
-            self._merge_body_messages(self._build_canonical_raw_messages(chat_id), body)
+        text_only_db_messages = self._build_text_only_messages(db_messages)
+        text_only_db_messages = self._package_messages(
+            self._prepare_db_messages(text_only_db_messages)
         )
 
-    def _prepare_outlet_state(
-        self,
-        chat_id: str,
-        body: dict,
-    ) -> Dict[str, Any]:
-        messages_raw = self._build_canonical_raw_messages(chat_id)
-        messages_raw = self._normalize_messages(
-            self._merge_body_last_message(messages_raw, body)
-        )
-        summary_state = self._get_summary_state(chat_id)
-        raw_pools = self._split_message_pools(
-            messages_raw,
+        pools = self._split_message_pools(
+            text_only_db_messages,
             summary_state.until_ts,
             self.valves.keep_start_messages,
             self.valves.keep_last_messages,
         )
-        raw_compressible_tokens, raw_threshold_tokens = self._compression_metrics(
-            messages_raw, raw_pools
-        )
-        messages_working, trim_stats = self._trim_message_content(messages_raw)
-        messages_working = self._normalize_messages(messages_working)
-        working_pools = self._split_message_pools(
-            messages_working,
-            summary_state.until_ts,
-            self.valves.keep_start_messages,
-            self.valves.keep_last_messages,
-        )
-        working_compressible = [
-            messages_working[i]
-            for i in sorted(working_pools.compressible_indices)
-            if not self._message_has_passthrough_media(messages_working[i])
-        ]
-        active_source_messages = self._build_active_request_messages(chat_id, body)
-        return {
-            "messages_raw": messages_raw,
-            "messages_working": messages_working,
-            "summary_state": summary_state,
-            "raw_pools": raw_pools,
-            "working_pools": working_pools,
-            "raw_compressible_tokens": raw_compressible_tokens,
-            "raw_threshold_tokens": raw_threshold_tokens,
-            "working_compressible": working_compressible,
-            "trim_stats": trim_stats,
-            "active_source_messages": active_source_messages,
-        }
+
+        # Apply trimming to the compressible messages
+        if pools.compressible:
+            trim_targets = set(range(len(pools.compressible)))
+            trimmed_compressible, _ = self.reconstructor.trim_tool_content(
+                pools.compressible,
+                self.valves.tool_trim_threshold,
+                target_indices=trim_targets,
+            )
+            return trimmed_compressible
+
+        return []
 
     def _get_chat_id(self, body: dict, metadata: Optional[dict]) -> Optional[str]:
         if metadata and isinstance(metadata, dict):
             chat_id = metadata.get("chat_id") or metadata.get("chatId")
             if chat_id:
                 return str(chat_id)
+
         if body and isinstance(body, dict):
             chat_id = body.get("chat_id") or body.get("chatId")
             if chat_id:
@@ -1077,28 +1063,35 @@ class Filter:
                 chat_id = meta.get("chat_id") or meta.get("chatId")
                 if chat_id:
                     return str(chat_id)
+
         return None
 
     def _load_db_messages_by_chat_id(self, chat_id: str) -> List[Dict[str, Any]]:
         if not chat_id or Chats is None:
             return []
+
         try:
             chat_record = Chats.get_chat_by_id(chat_id)
         except Exception as exc:
             logger.warning(f"[Chat Load] Failed to fetch chat {chat_id}: {exc}")
             return []
+
         chat_payload = getattr(chat_record, "chat", None)
         if not isinstance(chat_payload, dict):
             return []
+
         direct_messages = chat_payload.get("messages")
         if isinstance(direct_messages, list) and direct_messages:
             return self._unfold_messages(deepcopy(direct_messages))
+
         history = chat_payload.get("history")
         if not isinstance(history, dict):
             return []
+
         history_messages = history.get("messages")
         if not isinstance(history_messages, dict) or not history_messages:
             return []
+
         current_id = history.get("currentId") or history.get("current_id")
         return self._unfold_messages(
             self._reconstruct_active_history_branch(history_messages, current_id)
@@ -1109,6 +1102,7 @@ class Filter:
     ) -> List[Dict[str, Any]]:
         if not isinstance(history_messages, dict) or not history_messages:
             return []
+
         if isinstance(current_id, str) and current_id in history_messages:
             ordered_messages: List[Dict[str, Any]] = []
             visited = set()
@@ -1123,6 +1117,7 @@ class Filter:
             if ordered_messages:
                 ordered_messages.reverse()
                 return ordered_messages
+
         sortable_messages = []
         for index, node in enumerate(history_messages.values()):
             if not isinstance(node, dict):
@@ -1131,6 +1126,7 @@ class Filter:
             if timestamp is None:
                 timestamp = index
             sortable_messages.append((float(timestamp), index, deepcopy(node)))
+
         sortable_messages.sort(key=lambda item: (item[0], item[1]))
         return [message for _, _, message in sortable_messages]
 
@@ -1146,49 +1142,28 @@ class Filter:
         chat_id = self._get_chat_id(body, __metadata__)
         if not chat_id:
             return body
-        messages_raw = self._build_canonical_raw_messages(chat_id)
-        active_source_messages = self._build_active_request_messages(chat_id, body)
+
         summary_state = self._get_summary_state(chat_id)
-        active_messages, trim_stats = self._build_inlet_messages(
-            active_source_messages, summary_state
+        db_messages = self._load_chat_messages(chat_id)
+        media_messages = self._extract_media_messages_from_body(body)
+
+        view = self._build_runtime_view(
+            db_messages,
+            media_messages,
+            summary_state,
         )
-        body["messages"] = active_messages
-        inlet_pools = self._split_message_pools(
-            messages_raw,
-            summary_state.until_ts,
-            self.valves.keep_start_messages,
-            self.valves.keep_last_messages,
+        
+        logger.info(view.final_messages)
+    
+        body["messages"] = view.final_messages
+
+        self._debug_runtime_view(chat_id, "inlet", view, summary_state)
+
+        await self._emit_status(
+            __event_emitter__,
+            view.stats_message,
+            done=True,
         )
-        self._debug_pool_snapshot(
-            chat_id, messages_raw, inlet_pools, summary_state.until_ts, "inlet"
-        )
-        if self.valves.debug_logging:
-            try:
-                logger.debug(
-                    "[Context Manager][inlet][%s] canonical=%s active_source=%s",
-                    chat_id,
-                    len(messages_raw),
-                    len(active_source_messages),
-                )
-            except Exception:
-                pass
-        if self.valves.debug_logging and trim_stats.get("trimmed_count"):
-            protected_note = (
-                " protected=on" if trim_stats.get("protected_trim_applied") else ""
-            )
-            logger.debug(
-                "[Context Manager][inlet][%s] tool trim applied in-memory only: trimmed=%s removed_chars=%s%s",
-                chat_id,
-                trim_stats.get("trimmed_count", 0),
-                trim_stats.get("chars_removed", 0),
-                protected_note,
-            )
-        stats_message = self._build_stats_message(
-            messages=messages_raw,
-            summary_content=summary_state.content,
-            until_ts=summary_state.until_ts,
-        )
-        await self._emit_status(__event_emitter__, f"🔄{stats_message}", done=True)
         return body
 
     async def outlet(
@@ -1203,81 +1178,61 @@ class Filter:
         chat_id = self._get_chat_id(body, __metadata__)
         if not chat_id:
             return body
-        outlet_state = self._prepare_outlet_state(chat_id, body)
-        messages_raw = outlet_state["messages_raw"]
-        messages_working = outlet_state["messages_working"]
-        summary_state = outlet_state["summary_state"]
-        working_pools = outlet_state["working_pools"]
-        raw_compressible_tokens = outlet_state["raw_compressible_tokens"]
-        raw_threshold_tokens = outlet_state["raw_threshold_tokens"]
-        working_compressible = outlet_state["working_compressible"]
-        trim_stats = outlet_state["trim_stats"]
-        active_source_messages = outlet_state["active_source_messages"]
-        self._debug_pool_snapshot(
-            chat_id,
-            messages_working,
-            working_pools,
-            summary_state.until_ts,
-            "outlet-before",
+
+        summary_state = self._get_summary_state(chat_id)
+        db_messages = self._load_chat_messages(chat_id)
+        
+        # inject assistant message as it has yet to be written to DB
+        db_messages.append(body["messages"][-1])
+
+        media_messages = self._extract_media_messages_from_body(body)
+
+        view = self._build_runtime_view(
+            db_messages,
+            media_messages,
+            summary_state,
         )
-        if self.valves.debug_logging:
-            try:
-                logger.debug(
-                    "[Context Manager][outlet][%s] canonical=%s active_source=%s",
-                    chat_id,
-                    len(messages_raw),
-                    len(active_source_messages),
-                )
-            except Exception:
-                pass
-        if self.valves.debug_logging and trim_stats.get("trimmed_count"):
-            logger.debug(
-                "[Context Manager][outlet][%s] tool trim applied to summarization snapshot only: trimmed=%s removed_chars=%s",
-                chat_id,
-                trim_stats.get("trimmed_count", 0),
-                trim_stats.get("chars_removed", 0),
-            )
+        
+        compressible_text_messages = self._get_compressible_text_messages(
+            db_messages, summary_state
+        )
+
+        self._debug_runtime_view(chat_id, "outlet-before", view, summary_state)
+
         if (
-            raw_threshold_tokens > self.valves.compression_threshold_tokens
-            and working_compressible
+            view.uncompressed_tokens > self.valves.compression_threshold_tokens
+            and compressible_text_messages
         ):
             await self._emit_status(
                 __event_emitter__,
-                f"Summarizing {raw_compressible_tokens:,} new tokens...",
+                f"Summarizing {view.uncompressed_tokens:,} new tokens...",
                 done=False,
             )
             lock = self._lock_for(chat_id)
             if not lock.locked():
                 await self._background_compress(
-                    lock,
-                    chat_id,
-                    summary_state.content,
-                    working_compressible,
-                    self.valves.summary_model or body.get("model"),
-                    __user__,
-                    __event_emitter__,
-                    __request__,
+                    lock=lock,
+                    chat_id=chat_id,
+                    old_summary_content=summary_state.content,
+                    compressible_messages=compressible_text_messages,
+                    model_id=self.valves.summary_model or body.get("model"),
+                    user_data=__user__,
+                    emitter=__event_emitter__,
+                    request=__request__,
                 )
                 summary_state = self._get_summary_state(chat_id)
-                refreshed_working_pools = self._split_message_pools(
-                    messages_working,
-                    summary_state.until_ts,
-                    self.valves.keep_start_messages,
-                    self.valves.keep_last_messages,
+                view = self._build_runtime_view(
+                    db_messages,
+                    media_messages,
+                    summary_state,
                 )
-                self._debug_pool_snapshot(
-                    chat_id,
-                    messages_working,
-                    refreshed_working_pools,
-                    summary_state.until_ts,
-                    "outlet-after",
-                )
-        stats_message = self._build_stats_message(
-            messages=messages_raw,
-            summary_content=summary_state.content,
-            until_ts=summary_state.until_ts,
+                self._debug_runtime_view(chat_id, "outlet-after", view, summary_state)
+
+        await self._emit_status(
+            __event_emitter__,
+            view.stats_message,
+            done=True,
         )
-        await self._emit_status(__event_emitter__, f"✅{stats_message}", done=True)
         return body
 
     async def _background_compress(
@@ -1285,7 +1240,7 @@ class Filter:
         lock: asyncio.Lock,
         chat_id: str,
         old_summary_content: str,
-        compressible: List[Dict[str, Any]],
+        compressible_messages: List[Dict[str, Any]],
         model_id: Optional[str],
         user_data: Optional[dict],
         emitter: Optional[Callable],
@@ -1296,52 +1251,67 @@ class Filter:
                 if not model_id:
                     await self._emit_status(emitter, "⚠️ Summary failed: missing model")
                     return
-                if not compressible:
+
+                if not compressible_messages:
                     return
+
                 pool_text = "\n".join(
-                    f"{m.get('role', 'user').upper()}: {TokenCounter.extract_text(m.get('content', ''))}"
-                    for m in compressible
-                    if m.get("role") != "system"
+                    f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    for m in compressible_messages
+                    if m.get("content")
                 ).strip()
+
                 if not pool_text:
                     return
+
                 prompt = f"""
-You are the \"Context Architect\" responsible for maintaining a conversation's Permanent Archive.
+You are the "Context Architect" responsible for maintaining a conversation's Permanent Archive.
+
 ### CURRENT ARCHIVE:
 {old_summary_content or "No existing archive."}
+
 ### NEW EVENTS TO INTEGRATE:
 {pool_text}
+
 ### YOUR TASK:
 Integrate the NEW EVENTS into the CURRENT ARCHIVE to create a single, cohesive, and updated summary.
+
 ### GUIDELINES:
 1. UPDATE FACTS: If new information contradicts or evolves the archive, update the record accordingly.
 2. CATEGORIZE: Maintain sections for [General Context], [User Preferences], and [Key Narrative/Context].
 3. DEDUPLICATE: Do not repeat information already clearly stated in the archive.
 4. BE ATOMIC: Use concise bullet points. Focus on what was decided and what is the current state.
 5. IGNORE: Discard greetings, meta-talk about the AI, image payload details, and transient errors unless materially important.
+
 ### OUTPUT:
-Provide ONLY the updated archive text. No conversational filler, no markdown blocks, no \"Here is the summary.\"
+Provide ONLY the updated archive text. No conversational filler, no markdown blocks, no "Here is the summary."
 """
+
                 user = None
                 if user_data and user_data.get("id"):
                     user = await asyncio.to_thread(
                         Users.get_user_by_id, user_data.get("id")
                     )
+
                 if user is None:
                     await self._emit_status(
                         emitter, "⚠️ Summary failed: missing user context"
                     )
                     return
+
                 payload = {
                     "model": model_id,
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                     "temperature": 0,
                 }
+
                 active_request = request or Request(scope={"type": "http"})
                 response = await generate_chat_completion(active_request, payload, user)
+
                 if hasattr(response, "body"):
                     response = json.loads(response.body.decode())
+
                 if not (
                     response and isinstance(response, dict) and response.get("choices")
                 ):
@@ -1349,25 +1319,30 @@ Provide ONLY the updated archive text. No conversational filler, no markdown blo
                         emitter, "⚠️ Summary failed: invalid model response"
                     )
                     return
+
                 new_summary_content = response["choices"][0]["message"][
                     "content"
                 ].strip()
+
                 if not new_summary_content:
                     await self._emit_status(emitter, "⚠️ Summary failed: empty summary")
                     return
-                valid_ts = [self._timestamp_of(m) for m in compressible]
+
+                valid_ts = [self._timestamp_of(m) for m in compressible_messages]
                 valid_ts = [ts for ts in valid_ts if ts is not None]
                 until_ts = (
                     max(valid_ts)
                     if valid_ts
                     else int(datetime.now(timezone.utc).timestamp())
                 )
+
                 store = _get_store()
                 if store is None:
                     await self._emit_status(
                         emitter, "⚠️ Summary failed: storage not available"
                     )
                     return
+
                 saved = store.save(
                     chat_id=chat_id,
                     content=new_summary_content,
@@ -1378,21 +1353,21 @@ Provide ONLY the updated archive text. No conversational filler, no markdown blo
                         emitter, "⚠️ Summary generated but save failed"
                     )
                     return
-                pool_tokens = sum(
-                    TokenCounter.count(m)
-                    for m in compressible
-                    if not self._message_has_passthrough_media(m)
-                )
+
+                pool_tokens = sum(TokenCounter.count(m) for m in compressible_messages)
                 summary_tokens = TokenCounter.count(new_summary_content)
+
                 efficiency = None
                 if pool_tokens > 0:
                     efficiency = max(
                         0.0, min(100.0, (1.0 - (summary_tokens / pool_tokens)) * 100.0)
                     )
+
                 eff_str = (
                     f" {efficiency:.2f}% efficiency" if efficiency is not None else ""
                 )
                 await self._emit_status(emitter, f"💾 Summary saved!{eff_str}")
+
             except Exception as e:
                 logger.error(
                     f"[Context Manager] Background compression failed: {e}",
