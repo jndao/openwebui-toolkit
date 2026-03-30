@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.3-dev.8
+version: 0.0.3-dev.9
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -132,8 +132,8 @@ class RuntimeSegments:
         merged.extend(self.protected_start)
         if self.summary_message:
             merged.append(self.summary_message)
-        merged.extend(self.media_messages)
         merged.extend(self.uncompressed)
+        merged.extend(self.media_messages)
         merged.extend(self.protected_end)
         return merged
 
@@ -776,7 +776,7 @@ class Filter:
         )
 
         stats = (
-            f"✅🪙 {self._format_token_count(total_tokens)} │ "
+            f"🪙 {self._format_token_count(total_tokens)} │ "
             f"🛡️ {self._format_token_count(protected_tokens)} ({protected_count}) · "
             f"⏳ {self._format_token_count(uncompressed_tokens)} ({uncompressed_count}) · "
             f"📦 {self._format_token_count(summary_tokens)} ({len(summarized_messages)}{ f" @ {round((summarized_tokens - summary_tokens)/summarized_tokens * 100, 2)}%" if summary_tokens > 0 else ""})"
@@ -1161,7 +1161,7 @@ class Filter:
 
         await self._emit_status(
             __event_emitter__,
-            view.stats_message,
+            f"💭{view.stats_message}",
             done=True,
         )
         return body
@@ -1230,7 +1230,7 @@ class Filter:
 
         await self._emit_status(
             __event_emitter__,
-            view.stats_message,
+            f"✅{view.stats_message}",
             done=True,
         )
         return body
