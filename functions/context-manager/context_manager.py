@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.3-dev.10
+version: 0.0.3-dev.11
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -522,6 +522,10 @@ class Filter:
             default=1000,
             description="Tool outputs, tool-call arguments, or <details> result blocks larger than this token count are eligible for trimming.",
         )
+        trim_protected_messages: bool = Field(
+            default=False,
+            description="Apply tool content trimming to protected messages (protected_start and protected_end).",
+        )
         debug_logging: bool = Field(
             default=False,
             description="Enable detailed console logging.",
@@ -932,7 +936,6 @@ class Filter:
             max(0, message_count - keep_start)
         )
 
-        # Use the new v2 pools that returns message lists
         pools = self._split_message_pools(
             db_messages,
             summary_state.until_ts,
@@ -948,9 +951,27 @@ class Filter:
             target_indices=trim_targets,
         )
 
-        # Package the segments
-        protected_start = self._package_messages(pools.protected_start)
-        protected_end = self._package_messages(pools.protected_end)
+        # Package the segments (optionally trim protected messages)
+        if self.valves.trim_protected_messages and pools.protected_start:
+            trimmed_protected_start, _ = self.reconstructor.trim_tool_content(
+                pools.protected_start,
+                self.valves.tool_trim_threshold,
+                target_indices=set(range(len(pools.protected_start))),
+            )
+            protected_start = self._package_messages(trimmed_protected_start)
+        else:
+            protected_start = self._package_messages(pools.protected_start)
+        
+        if self.valves.trim_protected_messages and pools.protected_end:
+            trimmed_protected_end, _ = self.reconstructor.trim_tool_content(
+                pools.protected_end,
+                self.valves.tool_trim_threshold,
+                target_indices=set(range(len(pools.protected_end))),
+            )
+            protected_end = self._package_messages(trimmed_protected_end)
+        else:
+            protected_end = self._package_messages(pools.protected_end)
+        
         uncompressed = self._package_messages(trimmed_compressible)
 
         # Build summary message
@@ -1228,7 +1249,7 @@ class Filter:
 
         await self._emit_status(
             __event_emitter__,
-            f"✅{view.stats_message}",
+            f"☑️{view.stats_message}",
             done=True,
         )
         return body
