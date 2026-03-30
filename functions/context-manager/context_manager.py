@@ -9,6 +9,7 @@ repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 """
+
 import asyncio
 import json
 import logging
@@ -28,6 +29,7 @@ from open_webui.internal.db import get_db_context
 
 try:
     import tiktoken
+
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except ImportError:
     ENCODING = None
@@ -56,6 +58,7 @@ TOOL_RESULT_ATTR_RE = re.compile(r'result="([^"]*)"')
 def _discover_owui_schema() -> Optional[str]:
     try:
         from open_webui.config import DATABASE_SCHEMA
+
         schema = (
             DATABASE_SCHEMA.value
             if hasattr(DATABASE_SCHEMA, "value")
@@ -69,6 +72,7 @@ def _discover_owui_schema() -> Optional[str]:
 _owui_schema = _discover_owui_schema()
 
 if owui_Base is not None and Column is not None:
+
     class ChatManifest(owui_Base):
         __tablename__ = "chat_manifests"
         __table_args__ = (
@@ -86,6 +90,7 @@ if owui_Base is not None and Column is not None:
             default=lambda: datetime.now(timezone.utc),
             onupdate=lambda: datetime.now(timezone.utc),
         )
+
 else:
     ChatManifest = None
 
@@ -475,7 +480,10 @@ class Filter:
         return False
 
     class Valves(BaseModel):
-        emit_status_events: bool = Field(default=True, description="Toggle whether users should see Context Manager events in OWUI")
+        emit_status_events: bool = Field(
+            default=True,
+            description="Toggle whether users should see Context Manager events in OWUI",
+        )
         compression_threshold_tokens: int = Field(
             default=40000,
             description="Trigger archival when the 'Compressible' zone exceeds this token count. Higher values keep more history in full detail but increase costs.",
@@ -746,7 +754,9 @@ class Filter:
         protected_indices = set(range(start_end_idx))
         protected_indices.update(range(tail_start_idx, total_msgs))
         media_indices = {
-            i for i, msg in enumerate(messages) if self._message_has_passthrough_media(msg)
+            i
+            for i, msg in enumerate(messages)
+            if self._message_has_passthrough_media(msg)
         }
         protected_indices.update(media_indices)
         summary_indices = set()
@@ -951,8 +961,10 @@ class Filter:
             db_messages, summary_state, pools
         )
         target_indices = {
-            i for i in target_indices
-            if 0 <= i < len(db_messages) and not self._message_has_passthrough_media(db_messages[i])
+            i
+            for i in target_indices
+            if 0 <= i < len(db_messages)
+            and not self._message_has_passthrough_media(db_messages[i])
         }
         trimmed_messages, trim_stats = self.reconstructor.trim_tool_content(
             db_messages,
@@ -968,7 +980,9 @@ class Filter:
             active_messages = [summary_msg]
             if summary_state.until_ts is not None:
                 for msg in trimmed_messages:
-                    if self._message_has_passthrough_media(msg) or self._is_message_after_timestamp(msg, summary_state.until_ts):
+                    if self._message_has_passthrough_media(
+                        msg
+                    ) or self._is_message_after_timestamp(msg, summary_state.until_ts):
                         active_messages.append(msg)
             else:
                 active_messages.extend(trimmed_messages)
