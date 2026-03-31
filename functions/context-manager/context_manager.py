@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.0.3-dev.13
+version: 0.0.3-dev.14
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -1284,8 +1284,8 @@ class Filter:
                     return
 
                 prompt = f"""
-You are the "Context Architect" responsible for maintaining a conversation's Permanent Archive.
-You receive the current archive and new conversation events. Your task is to produce a single updated archive that replaces the old one entirely.
+You are the "Context Architect" responsible for maintaining a conversation's archive.
+You receive the current archive and new conversation events. You are to produce a single updated archive that replaces the old one entirely.
 
 ### ARCHIVE STRUCTURE
 The archive must always contain exactly these five sections in this order. Include every section header even if empty.
@@ -1294,7 +1294,7 @@ The archive must always contain exactly these five sections in this order. Inclu
 Facts, preferences, and active conditions that are true right now.
 Each entry must include a confidence percentage reflecting how certain it is based on the conversation.
 Examples:
-- SearXNG running at s.yawn.dev inside Proxmox LXC (95%)
+- SearXNG running at searxng.example.com inside a docker container (95%)
 - User prefers flexible daily plans over rigid itineraries (85%)
 - Considering autumn for the trip, not yet finalized (60%)
 - Backend uses Valkey, not Redis (95%)
@@ -1304,7 +1304,7 @@ Confidence guidelines:
 - 90–100%: Directly stated, verified, implemented, or clearly demonstrated
 - 70–89%: Strongly implied or consistently indicated but not explicitly confirmed
 - 50–69%: Mentioned, under discussion, or tentatively suggested
-- Below 50%: Do not include. If it is too uncertain, omit it.
+- Below 50%: Do not include.
 
 Cover all relevant domains — technical, creative, logistical, personal, or any other. Do not limit this section to technical facts only.
 
@@ -1324,20 +1324,22 @@ This includes: code, config, commands, contracts, schemas, regex, merge orders, 
 Replace earlier versions when a newer final version is adopted. Never keep both.
 If nothing applies, write "(none)".
 Do not include exploratory, rejected, partial, or superseded code.
+(You may use markdown code blocks inside this section).
 
 ## Open Items
 Unresolved questions, pending actions, or things still under discussion.
 Remove items once resolved or decided elsewhere in the archive.
 
 ### RULES
-1. REPLACE, DON'T APPEND: When new information updates or supersedes existing archive content, replace the old entry. The archive reflects current state, not change history.
-2. NO HALLUCINATION: Only include information directly stated or clearly implied by the conversation. Never invent, infer, or assume facts not supported by the dialogue.
-3. DEDUPLICATE: If the same fact appears in multiple sections, keep it only in the most appropriate section.
-4. BE CONCISE: Use bullet points. Avoid paragraphs. Strip filler words. Every entry should earn its place.
-5. PRESERVE TERMINOLOGY: Use the same terms and naming conventions the user uses. Do not rephrase or standardize terminology the user has deliberately chosen.
-6. BE DOMAIN-AGNOSTIC: The archive applies to any conversation type — technical, creative, planning, personal, or mixed. Apply the same structure and rigor regardless of topic.
-7. TRACK PREFERENCES: Record user preferences wherever they appear — tools, models, workflows, communication style, design taste, workflow habits, or any expressed preference.
-8. OMIT: Greetings, meta-talk about the AI, acknowledgments, pleasantries, and transient small talk. Only include interaction details if they reveal a preference, decision, or materially important context.
+1. PRECEDENCE: If new events contradict the old archive, the new events take precedence. The archive must reflect the latest reality.
+2. REPLACE, DON'T APPEND: When new information updates or supersedes existing archive content, replace the old entry. The archive reflects current state, not change history.
+3. NO HALLUCINATION: Only include information directly stated or clearly implied by the conversation. Never invent, infer, or assume facts not supported by the dialogue.
+4. DEDUPLICATE: If the same fact appears in multiple sections, keep it only in the most appropriate section.
+5. BE CONCISE: Use bullet points. Avoid paragraphs. Strip filler words. Every entry should earn its place.
+6. PRESERVE TERMINOLOGY: Use the same terms and naming conventions the user uses. Do not rephrase or standardize terminology the user has deliberately chosen.
+7. BE DOMAIN-AGNOSTIC: The archive applies to any conversation type — technical, creative, planning, personal, or mixed. Apply the same structure and rigor regardless of topic.
+8. TRACK PREFERENCES: Record user preferences wherever they appear — tools, models, workflows, communication style, design taste, workflow habits, or any expressed preference.
+9. OMIT: Greetings, meta-talk about the AI, acknowledgments, pleasantries, and transient small talk. Only include interaction details if they reveal a preference, decision, or materially important context.
 
 ### CURRENT ARCHIVE:
 {old_summary_content or "No existing archive."}
@@ -1348,7 +1350,8 @@ Remove items once resolved or decided elsewhere in the archive.
 ### OUTPUT:
 Provide ONLY the updated archive text.
 Do not include conversational filler.
-Do not wrap in markdown fences.
+Do not wrap the entire response in markdown fences (e.g., n
+o markdown at the start).
 Do not say "Here is the summary" or similar.
 Start directly with "## Current State".
 """
