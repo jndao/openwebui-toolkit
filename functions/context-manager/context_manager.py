@@ -3,13 +3,12 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.1.0-preview.2
+version: 0.1.0-preview.3
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 """
-
 import asyncio
 import json
 import logging
@@ -93,7 +92,6 @@ if owui_Base is not None and Column is not None:
             default=lambda: datetime.now(timezone.utc),
             onupdate=lambda: datetime.now(timezone.utc),
         )
-
 else:
     ChatManifest = None
 
@@ -108,6 +106,7 @@ class SummaryState:
 @dataclass
 class MessagePools:
     """Message pools returned as actual message lists."""
+
     protected_start: List[Dict[str, Any]]
     summarized: List[Dict[str, Any]]
     compressible: List[Dict[str, Any]]
@@ -117,6 +116,7 @@ class MessagePools:
 @dataclass
 class RuntimeSegments:
     """Runtime message segments in deterministic merge order."""
+
     protected_start: List[Dict[str, Any]]
     summary_message: Optional[Dict[str, Any]]
     media_messages: List[Dict[str, Any]]
@@ -141,6 +141,7 @@ class RuntimeSegments:
 @dataclass
 class RuntimeView:
     """Runtime view with explicit segments and accurate stats."""
+
     final_messages: List[Dict[str, Any]]
     stats_message: str
     segments: RuntimeSegments
@@ -159,10 +160,12 @@ class SummaryStore:
     def _ensure_table(self):
         if self._initialized:
             return self._init_error is None
+
         self._initialized = True
         try:
             if ChatManifest is None:
                 raise RuntimeError("Database table dependencies are unavailable")
+
             with get_db_context() as db:
                 ChatManifest.__table__.create(bind=db.bind, checkfirst=True)
                 db.commit()
@@ -177,6 +180,7 @@ class SummaryStore:
     def get(self, chat_id: str) -> Optional[Dict[str, Any]]:
         if not self._ensure_table():
             return None
+
         try:
             with get_db_context() as db:
                 record = db.query(ChatManifest).filter_by(chat_id=chat_id).first()
@@ -196,6 +200,7 @@ class SummaryStore:
     ) -> bool:
         if not self._ensure_table():
             return False
+
         try:
             with get_db_context() as db:
                 record = db.query(ChatManifest).filter_by(chat_id=chat_id).first()
@@ -214,11 +219,13 @@ class SummaryStore:
         except Exception as e:
             logger.error(f"[SummaryStore] Failed to save summary: {e}")
             return False
+
         return True
 
     def delete(self, chat_id: str) -> bool:
         if not self._ensure_table():
             return False
+
         try:
             with get_db_context() as db:
                 db.query(ChatManifest).filter_by(chat_id=chat_id).delete()
@@ -269,8 +276,8 @@ class TokenCounter:
     @staticmethod
     def _count_message(msg: Dict[str, Any]) -> int:
         total = 0
-
         content = msg.get("content", "")
+
         if isinstance(content, str):
             total += TokenCounter._count_text(content)
         elif isinstance(content, dict):
@@ -291,21 +298,17 @@ class TokenCounter:
             for tool_call in tool_calls:
                 if not isinstance(tool_call, dict):
                     continue
-
                 tool_call_id = tool_call.get("id")
                 if isinstance(tool_call_id, str):
                     total += TokenCounter._count_text(tool_call_id)
-
                 tool_call_type = tool_call.get("type")
                 if isinstance(tool_call_type, str):
                     total += TokenCounter._count_text(tool_call_type)
-
                 function_payload = tool_call.get("function")
                 if isinstance(function_payload, dict):
                     function_name = function_payload.get("name")
                     if isinstance(function_name, str):
                         total += TokenCounter._count_text(function_name)
-
                     arguments = function_payload.get("arguments")
                     if isinstance(arguments, str):
                         total += TokenCounter._count_text(arguments)
@@ -325,7 +328,6 @@ class TokenCounter:
     def extract_text(content: Any) -> str:
         if isinstance(content, str):
             return content
-
         if isinstance(content, dict):
             content_type = str(content.get("type", "")).strip().lower()
             if content_type in {"text", "input_text"}:
@@ -336,7 +338,6 @@ class TokenCounter:
                 if isinstance(nested_content, str):
                     return nested_content
             return ""
-
         if isinstance(content, list):
             texts = []
             for part in content:
@@ -353,7 +354,6 @@ class TokenCounter:
                 elif isinstance(part, str):
                     texts.append(part)
             return " ".join(t for t in texts if t)
-
         return ""
 
 
@@ -377,7 +377,6 @@ class ContextReconstructor:
 
     def normalize_tool_call_ids(self, messages: List[Dict[str, Any]]) -> int:
         rewritten_ids: Dict[str, str] = {}
-
         for message in messages:
             tool_calls = message.get("tool_calls")
             if not isinstance(tool_calls, list):
@@ -471,12 +470,15 @@ class ContextReconstructor:
                 if not result_match:
                     return block
                 result_payload = result_match.group(1)
+
                 if TokenCounter._count_text(result_payload) <= threshold:
                     return block
+
                 removed = max(0, len(result_payload) - len(collapsed_text))
                 stats["trimmed_count"] += 1
                 stats["detail_blocks_trimmed"] += 1
                 stats["chars_removed"] += removed
+
                 return TOOL_RESULT_ATTR_RE.sub(
                     f'result="{collapsed_text}"',
                     block,
@@ -500,7 +502,7 @@ class Filter:
         )
         max_context_tokens: int = Field(
             default=120000,
-            description="Hard limit for the model context window.",
+            description="Hard limit for the model context window. Oldest non-protected messages are shed if exceeded.",
         )
         keep_start_messages: int = Field(
             default=0,
@@ -557,7 +559,6 @@ class Filter:
         try:
             if isinstance(value, datetime):
                 return int(value.timestamp())
-
             if isinstance(value, str):
                 raw = value.strip()
                 if not raw:
@@ -573,24 +574,20 @@ class Filter:
                         )
                     except Exception:
                         return None
-
             if isinstance(value, (int, float)):
                 numeric = float(value)
                 if numeric <= 0:
                     return None
-
                 if numeric > 1e18:
                     numeric /= 1_000_000_000
                 elif numeric > 1e15:
                     numeric /= 1_000_000
                 elif numeric > 1e12:
                     numeric /= 1000
-
                 ts = int(numeric)
                 return ts
         except Exception:
             return None
-
         return None
 
     def _timestamp_of(self, msg: Dict[str, Any]) -> Optional[int]:
@@ -604,24 +601,20 @@ class Filter:
     def _message_identity(self, msg: Dict[str, Any]) -> str:
         if not isinstance(msg, dict):
             return ""
-
         for key in ("id", "message_id", "uuid"):
             value = msg.get(key)
             if value is not None:
                 value_str = str(value).strip()
                 if value_str:
                     return f"id:{value_str}"
-
         role = str(msg.get("role", ""))
         ts = self._timestamp_of(msg)
         content = TokenCounter.extract_text(msg.get("content", ""))
         return f"fallback:{role}:{ts}:{content[:200]}"
 
-
     def _unfold_messages(self, messages: Any) -> List[Dict[str, Any]]:
         if not messages:
             return []
-
         result = []
         for msg in messages:
             if not isinstance(msg, dict):
@@ -686,26 +679,26 @@ class Filter:
         """
         if not isinstance(body, dict):
             return []
-
         body_messages = body.get("messages")
         if not isinstance(body_messages, list):
             return []
-
+        
         media_messages: List[Dict[str, Any]] = []
         seen = set()
-
         for msg in body_messages:
             if not isinstance(msg, dict):
                 continue
             if not self._message_has_passthrough_media(msg):
                 continue
+            
             identity = self._message_identity(msg)
             if identity and identity in seen:
                 continue
             if identity:
                 seen.add(identity)
+            
             media_messages.append(deepcopy(msg))
-
+            
         # Return as-is - no normalization, no scrubbing
         return media_messages
 
@@ -725,7 +718,6 @@ class Filter:
         """Build the summary message to inject into the runtime payload."""
         if not summary_state or not summary_state.content:
             return None
-
         return {
             "role": "system",
             "content": f"<{SUMMARY_TAG}>\n{summary_state.content}\n</{SUMMARY_TAG}>",
@@ -754,6 +746,7 @@ class Filter:
         summary_message: Optional[Dict[str, Any]],
         uncompressed_messages: List[Dict[str, Any]],
         media_messages: List[Dict[str, Any]],
+        was_shed: bool = False,
     ) -> Tuple[str, int, int, int, int, int]:
         """Build runtime stats message from explicit segments.
         
@@ -783,8 +776,11 @@ class Filter:
             f"🪙 {self._format_token_count(total_tokens)} │ "
             f"🛡️ {self._format_token_count(protected_tokens)} ({protected_count}) · "
             f"⏳ {self._format_token_count(uncompressed_tokens)} ({uncompressed_count}) · "
-            f"📦 {self._format_token_count(summary_tokens)} ({len(summarized_messages)}{ f" @ {round((summarized_tokens - summary_tokens)/summarized_tokens * 100, 2)}%" if summarized_tokens > 0 else ""})"
+            f"📦 {self._format_token_count(summary_tokens)} ({len(summarized_messages)}{ f' @ {round((summarized_tokens - summary_tokens)/summarized_tokens * 100, 2)}%' if summarized_tokens > 0 else ''})"
         )
+
+        if was_shed:
+            stats = f"⚠️ Limit Reached │ {stats}"
 
         return (
             stats,
@@ -802,24 +798,14 @@ class Filter:
         keep_start: int,
         keep_end: int,
     ) -> MessagePools:
-        """Split messages into pools as actual message lists.
-        
-        Returns:
-            MessagePools with:
-            - protected_start: Always preserved start messages
-            - summarized: Messages covered by summary (excluded from payload)
-            - compressible: Live unsummarized middle (uncompressed in payload)
-            - protected_end: Always preserved end messages
-        """
+        """Split messages into pools as actual message lists."""
         total = len(messages)
-
         start_cut = min(max(keep_start, 0), total)
         end_count = min(max(keep_end, 0), max(0, total - start_cut))
         end_start = total - end_count
 
         protected_start = list(messages[:start_cut])
         protected_end = list(messages[end_start:]) if end_count > 0 else []
-
         middle = list(messages[start_cut:end_start])
 
         summarized: List[Dict[str, Any]] = []
@@ -842,26 +828,21 @@ class Filter:
     def _message_has_passthrough_media(self, message: Dict[str, Any]) -> bool:
         if not isinstance(message, dict):
             return False
-
         content = message.get("content")
         media_types = {"image_url", "file", "input_image", "input_file"}
-
         if isinstance(content, dict):
             return str(content.get("type", "")).strip().lower() in media_types
-
         if isinstance(content, list):
             for part in content:
                 if not isinstance(part, dict):
                     continue
                 if str(part.get("type", "")).strip().lower() in media_types:
                     return True
-
         return False
 
     def _build_text_only_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(message, dict):
             return None
-
         text_content = TokenCounter.extract_text(message.get("content", ""))
         if not text_content:
             return None
@@ -914,21 +895,58 @@ class Filter:
             packaged.append(msg_copy)
         return packaged
 
+    def _enforce_context_limits(
+        self,
+        protected_start: List[Dict[str, Any]],
+        summary_message: Optional[Dict[str, Any]],
+        media_messages: List[Dict[str, Any]],
+        uncompressed: List[Dict[str, Any]],
+        protected_end: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+        """Sheds oldest messages to ensure the payload fits within max_context_tokens."""
+        max_tokens = self.valves.max_context_tokens
+        if max_tokens <= 0:
+            return media_messages, uncompressed, protected_end, False
+
+        p_start_tok = self._count_tokens_in_messages(protected_start)
+        sum_tok = self._count_tokens_in_messages([summary_message]) if summary_message else 0
+        media_tok = self._count_tokens_in_messages(media_messages)
+        uncomp_tok = self._count_tokens_in_messages(uncompressed)
+        p_end_tok = self._count_tokens_in_messages(protected_end)
+
+        total = p_start_tok + sum_tok + media_tok + uncomp_tok + p_end_tok
+        was_shed = False
+
+        # Shedding priority: 1. Oldest Uncompressed -> 2. Oldest Media -> 3. Oldest Protected End
+        while total > max_tokens:
+            was_shed = True
+            if uncompressed:
+                dropped = uncompressed.pop(0)
+                dropped_tok = TokenCounter.count(dropped)
+                uncomp_tok -= dropped_tok
+                total -= dropped_tok
+            elif media_messages:
+                dropped = media_messages.pop(0)
+                dropped_tok = TokenCounter.count(dropped)
+                media_tok -= dropped_tok
+                total -= dropped_tok
+            elif len(protected_end) > 1: # Always keep at least the very last message
+                dropped = protected_end.pop(0)
+                dropped_tok = TokenCounter.count(dropped)
+                p_end_tok -= dropped_tok
+                total -= dropped_tok
+            else:
+                break # Cannot safely shed anymore
+
+        return media_messages, uncompressed, protected_end, was_shed
+
     def _build_runtime_view(
         self,
         db_messages: List[Dict[str, Any]],
         media_messages: List[Dict[str, Any]],
         summary_state: SummaryState,
     ) -> RuntimeView:
-        """Build the runtime message view using deterministic segments.
-        
-        Runtime merge order:
-        1. protected_start
-        2. summary
-        3. media
-        4. uncompressed (compressible)
-        5. protected_end
-        """
+        """Build the runtime message view using deterministic segments."""
         message_count = len(db_messages)
         keep_start = min(self.valves.keep_start_messages, message_count)
         keep_end = min(
@@ -973,9 +991,18 @@ class Filter:
             protected_end = self._package_messages(pools.protected_end)
         
         uncompressed = self._package_messages(trimmed_compressible)
-
+        
         # Build summary message
         summary_message = self._build_summary_message(summary_state)
+
+        # --- Enforce max context limits ---
+        media_messages, uncompressed, protected_end, was_shed = self._enforce_context_limits(
+            protected_start,
+            summary_message,
+            media_messages,
+            uncompressed,
+            protected_end
+        )
 
         # Build segments
         segments = RuntimeSegments(
@@ -988,7 +1015,6 @@ class Filter:
 
         # Build stats from explicit segments
         protected_all = protected_start + protected_end
-
         (
             stats_message,
             total_tokens,
@@ -1002,6 +1028,7 @@ class Filter:
             summary_message=summary_message,
             uncompressed_messages=uncompressed,
             media_messages=media_messages,
+            was_shed=was_shed,
         )
 
         return RuntimeView(
@@ -1079,6 +1106,7 @@ class Filter:
             chat_id = body.get("chat_id") or body.get("chatId")
             if chat_id:
                 return str(chat_id)
+
             meta = body.get("meta", {})
             if isinstance(meta, dict):
                 chat_id = meta.get("chat_id") or meta.get("chatId")
@@ -1114,6 +1142,7 @@ class Filter:
             return []
 
         current_id = history.get("currentId") or history.get("current_id")
+
         return self._unfold_messages(
             self._reconstruct_active_history_branch(history_messages, current_id)
         )
@@ -1128,6 +1157,7 @@ class Filter:
             ordered_messages: List[Dict[str, Any]] = []
             visited = set()
             cursor = current_id
+
             while isinstance(cursor, str) and cursor and cursor not in visited:
                 visited.add(cursor)
                 node = history_messages.get(cursor)
@@ -1135,6 +1165,7 @@ class Filter:
                     break
                 ordered_messages.append(deepcopy(node))
                 cursor = node.get("parentId") or node.get("parent_id")
+
             if ordered_messages:
                 ordered_messages.reverse()
                 return ordered_messages
@@ -1175,7 +1206,6 @@ class Filter:
         )
         
         body["messages"] = view.final_messages
-
         self._debug_runtime_view(chat_id, "inlet", view, summary_state)
 
         await self._emit_status(
@@ -1183,6 +1213,7 @@ class Filter:
             f"💭{view.stats_message}",
             done=True,
         )
+
         return body
 
     async def outlet(
@@ -1203,7 +1234,6 @@ class Filter:
         
         # inject assistant message as it has yet to be written to DB
         db_messages.append(body["messages"][-1])
-
         media_messages = self._extract_media_messages_from_body(body)
 
         view = self._build_runtime_view(
@@ -1215,18 +1245,23 @@ class Filter:
         compressible_text_messages = self._get_compressible_text_messages(
             db_messages, summary_state
         )
-
+        
+        # Count the actual tokens sitting uncompressed in the DB
+        db_uncompressed_tokens = self._count_tokens_in_messages(compressible_text_messages)
+        
         self._debug_runtime_view(chat_id, "outlet-before", view, summary_state)
 
+        # Trigger based on db_uncompressed_tokens, not view.uncompressed_tokens
         if (
-            view.uncompressed_tokens > self.valves.compression_threshold_tokens
+            db_uncompressed_tokens > self.valves.compression_threshold_tokens
             and compressible_text_messages
         ):
             await self._emit_status(
                 __event_emitter__,
-                f"Summarizing {view.uncompressed_tokens:,} new tokens...",
+                f"Summarizing {db_uncompressed_tokens:,} new tokens...",
                 done=False,
             )
+
             lock = self._lock_for(chat_id)
             if not lock.locked():
                 await self._background_compress(
@@ -1239,6 +1274,7 @@ class Filter:
                     emitter=__event_emitter__,
                     request=__request__,
                 )
+
                 summary_state = self._get_summary_state(chat_id)
                 view = self._build_runtime_view(
                     db_messages,
@@ -1252,6 +1288,7 @@ class Filter:
             f"☑️{view.stats_message}",
             done=True,
         )
+
         return body
 
     async def _background_compress(
@@ -1274,14 +1311,48 @@ class Filter:
                 if not compressible_messages:
                     return
 
-                pool_text = "\n".join(
-                    f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-                    for m in compressible_messages
-                    if m.get("content")
-                ).strip()
+                # --- NEW: Summarizer Circuit Breaker (Chunking) ---
+                # Reserve 6k tokens for the system prompt and the generated output
+                budget = max(10000, self.valves.max_context_tokens - 6000)
+                
+                batch_to_compress = []
+                current_tokens = 0
+                pool_text = ""
+
+                for m in compressible_messages:
+                    msg_text = f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    msg_tokens = TokenCounter.count(msg_text)
+                    
+                    if current_tokens + msg_tokens > budget:
+                        if not batch_to_compress:
+                            # Edge Case: The very first message is larger than the entire budget!
+                            # We MUST process it to unblock the queue, so we truncate the text.
+                            # 1 token ~= 4 chars roughly.
+                            allowed_chars = budget * 3 
+                            pool_text = msg_text[:allowed_chars] + "\n...[CONTENT TRUNCATED FOR SUMMARY]..."
+                            batch_to_compress = [m]
+                            logger.warning(f"[Context Manager] Single message exceeded budget ({msg_tokens} > {budget}). Truncating for summary.")
+                        else:
+                            logger.info(f"[Context Manager] Chunking summary: taking {len(batch_to_compress)} of {len(compressible_messages)} messages to stay under {budget} tokens.")
+                        break # Stop adding messages to this batch
+                        
+                    batch_to_compress.append(m)
+                    current_tokens += msg_tokens
+
+                if not batch_to_compress:
+                    return
+
+                # If we didn't hit the massive single-message edge case, build the text normally
+                if not pool_text:
+                    pool_text = "\n".join(
+                        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                        for m in batch_to_compress
+                        if m.get("content")
+                    ).strip()
 
                 if not pool_text:
                     return
+                # --------------------------------------------------
 
                 prompt = f"""
 You are the "Context Architect" responsible for maintaining a conversation's archive.
@@ -1350,11 +1421,11 @@ Remove items once resolved or decided elsewhere in the archive.
 ### OUTPUT:
 Provide ONLY the updated archive text.
 Do not include conversational filler.
-Do not wrap the entire response in markdown fences (e.g., n
-o markdown at the start).
+Do not wrap the entire response in markdown fences (e.g., no markdown at the start).
 Do not say "Here is the summary" or similar.
 Start directly with "## Current State".
 """
+
                 user = None
                 if user_data and user_data.get("id"):
                     user = await asyncio.to_thread(
@@ -1396,13 +1467,15 @@ Start directly with "## Current State".
                     await self._emit_status(emitter, "⚠️ Summary failed: empty summary")
                     return
 
-                valid_ts = [self._timestamp_of(m) for m in compressible_messages]
+                # --- NEW: Only use timestamps from the batch we actually compressed ---
+                valid_ts = [self._timestamp_of(m) for m in batch_to_compress]
                 valid_ts = [ts for ts in valid_ts if ts is not None]
                 until_ts = (
                     max(valid_ts)
                     if valid_ts
                     else int(datetime.now(timezone.utc).timestamp())
                 )
+                # ----------------------------------------------------------------------
 
                 store = _get_store()
                 if store is None:
@@ -1416,13 +1489,15 @@ Start directly with "## Current State".
                     content=new_summary_content,
                     until_timestamp=until_ts,
                 )
+
                 if not saved:
                     await self._emit_status(
                         emitter, "⚠️ Summary generated but save failed"
                     )
                     return
 
-                pool_tokens = sum(TokenCounter.count(m) for m in compressible_messages)
+                # Stats based on the batch
+                pool_tokens = sum(TokenCounter.count(m) for m in batch_to_compress)
                 summary_tokens = TokenCounter.count(new_summary_content)
 
                 efficiency = None
@@ -1434,7 +1509,11 @@ Start directly with "## Current State".
                 eff_str = (
                     f" {efficiency:.2f}% efficiency" if efficiency is not None else ""
                 )
-                await self._emit_status(emitter, f"💾 Summary saved!{eff_str}")
+                
+                # If we chunked, let the user know there is more to go
+                chunk_str = f" (Chunk {len(batch_to_compress)}/{len(compressible_messages)})" if len(batch_to_compress) < len(compressible_messages) else ""
+                
+                await self._emit_status(emitter, f"💾 Summary saved!{eff_str}{chunk_str}")
 
             except Exception as e:
                 logger.error(
