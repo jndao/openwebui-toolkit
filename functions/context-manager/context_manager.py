@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.1.0-preview.1
+version: 0.1.0-preview.2
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -783,7 +783,7 @@ class Filter:
             f"🪙 {self._format_token_count(total_tokens)} │ "
             f"🛡️ {self._format_token_count(protected_tokens)} ({protected_count}) · "
             f"⏳ {self._format_token_count(uncompressed_tokens)} ({uncompressed_count}) · "
-            f"📦 {self._format_token_count(summary_tokens)} ({len(summarized_messages)}{ f" @ {round((summarized_tokens - summary_tokens)/summarized_tokens * 100, 2)}%" if summary_tokens > 0 else ""})"
+            f"📦 {self._format_token_count(summary_tokens)} ({len(summarized_messages)}{ f" @ {round((summarized_tokens - summary_tokens)/summarized_tokens * 100, 2)}%" if summarized_tokens > 0 else ""})"
         )
 
         return (
