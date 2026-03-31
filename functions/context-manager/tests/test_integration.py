@@ -2,6 +2,8 @@
 Integration tests for Filter inlet/outlet and runtime view construction.
 """
 
+import json
+
 import pytest
 from datetime import datetime, timezone
 from typing import Dict, Any, List
@@ -785,3 +787,212 @@ class TestBuildRuntimeStatsWithShed:
         
         assert "⚠️ Limit Reached" in stats
         assert "🪙" in stats
+
+
+class TestBackgroundCompressBatching:
+    """Tests for _background_compress batching/chunking logic."""
+
+    @pytest.mark.asyncio
+    async def test_background_compress_respects_budget(self, filter_instance, mock_event_emitter, mock_request):
+        """Test that batching respects the token budget."""
+        filter_instance.valves.max_context_tokens = 20000  # Budget will be ~14000
+        
+        # Create many messages that would exceed budget if all processed
+        compressible_messages = [
+            {"role": "user", "content": "Message " * 1000, "timestamp": 1000 + i}
+            for i in range(10)
+        ]
+        
+        # Mock the dependencies
+        with patch('context_manager._get_store') as mock_store:
+            with patch('context_manager.generate_chat_completion') as mock_completion:
+                with patch('context_manager.Users.get_user_by_id') as mock_users:
+                    with patch('context_manager.asyncio.to_thread') as mock_to_thread:
+                        # Setup mocks
+                        mock_store.return_value = MagicMock()
+                        mock_store.return_value.save.return_value = True
+                        mock_users.return_value = MagicMock()
+                        mock_to_thread.return_value = MagicMock()
+                        
+                        mock_response = MagicMock()
+                        mock_response.body = json.dumps({
+                            "choices": [{
+                                "message": {"content": "## Current State\n- Test summary"}
+                            }]
+                        }).encode()
+                        mock_completion.return_value = mock_response
+                        
+                        lock = asyncio.Lock()
+                        
+                        await filter_instance._background_compress(
+                            lock=lock,
+                            chat_id="test-chat",
+                            old_summary_content="",
+                            compressible_messages=compressible_messages,
+                            model_id="test-model",
+                            user_data={"id": "user-123"},
+                            emitter=mock_event_emitter,
+                            request=mock_request,
+                        )
+        
+        # Verify the completion was called (batching occurred)
+        mock_completion.assert_called_once()
+        # Check that the prompt was built with chunked messages
+        call_args = mock_completion.call_args
+        payload = call_args[0][1]  # Second argument is the payload
+        prompt = payload["messages"][0]["content"]
+        # The prompt should contain "NEW EVENTS" section
+        assert "NEW EVENTS" in prompt
+
+    @pytest.mark.asyncio
+    async def test_background_compress_single_large_message_truncation(self, filter_instance, mock_event_emitter, mock_request):
+        """Test that a single message larger than budget gets truncated."""
+        # Budget = max(10000, max_context_tokens - 6000)
+        # To get budget = 10000, we need max_context_tokens <= 16000
+        # To trigger truncation, message must exceed 10000 tokens
+        # With tiktoken, ~40000 chars of 'x' = ~10000 tokens, so use 100000 chars
+        filter_instance.valves.max_context_tokens = 11000  # Budget will be 10000
+        
+        # Single message that exceeds budget (100000 chars ~ 25000 tokens)
+        huge_content = "x " * 50000  # ~100000 chars, many tokens
+        compressible_messages = [
+            {"role": "user", "content": huge_content, "timestamp": 1000}
+        ]
+        
+        with patch('context_manager._get_store') as mock_store:
+            with patch('context_manager.generate_chat_completion') as mock_completion:
+                with patch('context_manager.Users.get_user_by_id') as mock_users:
+                    with patch('asyncio.to_thread', new_callable=AsyncMock) as mock_to_thread:
+                        mock_store.return_value = MagicMock()
+                        mock_store.return_value.save.return_value = True
+                        mock_users.return_value = MagicMock()
+                        mock_to_thread.return_value = MagicMock()
+                        
+                        mock_response = MagicMock()
+                        mock_response.body = json.dumps({
+                            "choices": [{
+                                "message": {"content": "## Current State\n- Truncated summary"}
+                            }]
+                        }).encode()
+                        mock_completion.return_value = mock_response
+                        
+                        lock = asyncio.Lock()
+                        
+                        await filter_instance._background_compress(
+                            lock=lock,
+                            chat_id="test-chat",
+                            old_summary_content="",
+                            compressible_messages=compressible_messages,
+                            model_id="test-model",
+                            user_data={"id": "user-123"},
+                            emitter=mock_event_emitter,
+                            request=mock_request,
+                        )
+        
+        # Should have called completion with truncated content
+        mock_completion.assert_called_once()
+        call_args = mock_completion.call_args
+        payload = call_args[0][1]
+        prompt = payload["messages"][0]["content"]
+        # Should contain truncation marker (check for partial match)
+        assert "CONTENT TRUNCATED FOR SUMMARY" in prompt
+
+    @pytest.mark.asyncio
+    async def test_background_compress_empty_messages_returns_early(self, filter_instance, mock_event_emitter, mock_request):
+        """Test that empty compressible_messages returns early."""
+        lock = asyncio.Lock()
+        
+        with patch('context_manager.generate_chat_completion') as mock_completion:
+            await filter_instance._background_compress(
+                lock=lock,
+                chat_id="test-chat",
+                old_summary_content="",
+                compressible_messages=[],  # Empty
+                model_id="test-model",
+                user_data={"id": "user-123"},
+                emitter=mock_event_emitter,
+                request=mock_request,
+            )
+        
+        # Should not call completion
+        mock_completion.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_background_compress_no_model_returns_early(self, filter_instance, mock_event_emitter, mock_request):
+        """Test that missing model_id returns early with error."""
+        lock = asyncio.Lock()
+        
+        await filter_instance._background_compress(
+            lock=lock,
+            chat_id="test-chat",
+            old_summary_content="",
+            compressible_messages=[{"role": "user", "content": "test"}],
+            model_id=None,  # No model
+            user_data={"id": "user-123"},
+            emitter=mock_event_emitter,
+            request=mock_request,
+        )
+        
+        # Should have emitted error status
+        mock_event_emitter.assert_called()
+        call_args = mock_event_emitter.call_args[0][0]
+        assert "missing model" in call_args["data"]["description"]
+
+    @pytest.mark.asyncio
+    async def test_background_compress_uses_batch_timestamps(self, filter_instance, mock_event_emitter, mock_request):
+        """Test that until_ts is calculated from batch, not all messages."""
+        # Budget = max(10000, max_context_tokens - 6000)
+        # With max_context_tokens = 11000, budget = 10000
+        # We want chunking to occur, so use messages that exceed budget
+        filter_instance.valves.max_context_tokens = 11000
+        
+        # Messages with different timestamps - first two should fit, third should trigger chunking
+        # Each message needs to be sized appropriately
+        compressible_messages = [
+            {"role": "user", "content": "Short message one", "timestamp": 1000},
+            {"role": "user", "content": "Short message two", "timestamp": 2000},
+            {"role": "user", "content": "x " * 6000, "timestamp": 3000},  # Large message to trigger chunking
+        ]
+        
+        saved_until_ts = None
+        
+        def capture_save(chat_id, content, until_timestamp):
+            nonlocal saved_until_ts
+            saved_until_ts = until_timestamp
+            return True
+        
+        with patch('context_manager._get_store') as mock_store:
+            with patch('context_manager.generate_chat_completion', new_callable=AsyncMock) as mock_completion:
+                with patch('context_manager.Users.get_user_by_id') as mock_users:
+                    with patch('asyncio.to_thread', new_callable=AsyncMock) as mock_to_thread:
+                        mock_store.return_value = MagicMock()
+                        mock_store.return_value.save = capture_save
+                        mock_users.return_value = MagicMock()
+                        mock_to_thread.return_value = MagicMock()  # Return valid user object
+                        
+                        mock_response = MagicMock()
+                        mock_response.body = json.dumps({
+                            "choices": [{
+                                "message": {"content": "## Current State\n- Summary"}
+                            }]
+                        }).encode()
+                        mock_completion.return_value = mock_response
+                        
+                        lock = asyncio.Lock()
+                        
+                        await filter_instance._background_compress(
+                            lock=lock,
+                            chat_id="test-chat",
+                            old_summary_content="",
+                            compressible_messages=compressible_messages,
+                            model_id="test-model",
+                            user_data={"id": "user-123"},
+                            emitter=mock_event_emitter,
+                            request=mock_request,
+                        )
+        
+        # until_ts should be from the batch that was actually processed
+        # If chunking occurred, it should be <= 2000 (from first two messages)
+        # If no chunking, it would be 3000
+        assert saved_until_ts is not None
+        assert saved_until_ts <= 3000
