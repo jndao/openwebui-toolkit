@@ -650,3 +650,138 @@ class TestLockFor:
         lock1 = filter_instance._lock_for("chat-1")
         lock2 = filter_instance._lock_for("chat-2")
         assert lock1 is not lock2
+
+
+class TestEnforceContextLimits:
+    """Tests for Filter._enforce_context_limits method."""
+
+    def test_enforce_context_limits_no_shedding(self, filter_instance):
+        """Test that no shedding occurs when under limit."""
+        filter_instance.valves.max_context_tokens = 100000
+        
+        protected_start = [{"role": "system", "content": "System"}]
+        summary_message = {"role": "system", "content": "Summary"}
+        media_messages = []
+        uncompressed = [{"role": "user", "content": "Hello"}]
+        protected_end = [{"role": "assistant", "content": "Hi"}]
+        
+        media, uncomp, p_end, was_shed = filter_instance._enforce_context_limits(
+            protected_start, summary_message, media_messages, uncompressed, protected_end
+        )
+        
+        assert was_shed is False
+        assert len(uncomp) == 1
+        assert len(p_end) == 1
+
+    def test_enforce_context_limits_shed_uncompressed(self, filter_instance):
+        """Test shedding oldest uncompressed messages first."""
+        # Set a very low limit that will definitely trigger shedding
+        filter_instance.valves.max_context_tokens = 10
+        
+        protected_start = [{"role": "system", "content": "System prompt that is long"}]
+        summary_message = None
+        media_messages = []
+        uncompressed = [
+            {"role": "user", "content": "First message to shed with enough content"},
+            {"role": "assistant", "content": "Second message with more content"},
+            {"role": "user", "content": "Third message with even more content"},
+        ]
+        protected_end = [{"role": "assistant", "content": "Final response here"}]
+        
+        media, uncomp, p_end, was_shed = filter_instance._enforce_context_limits(
+            protected_start, summary_message, media_messages, uncompressed, protected_end
+        )
+        
+        # With max_context_tokens=10, shedding should occur
+        # The total tokens will definitely exceed 10
+        assert was_shed is True
+        # Should have shed some messages from uncompressed
+        assert len(uncomp) < 3
+
+    def test_enforce_context_limits_shed_media_next(self, filter_instance):
+        """Test shedding media messages after uncompressed is empty."""
+        # Set a very low limit
+        filter_instance.valves.max_context_tokens = 5
+        
+        protected_start = [{"role": "system", "content": "System prompt here"}]
+        summary_message = None
+        media_messages = [
+            {"role": "user", "content": {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}}
+        ]
+        uncompressed = [{"role": "user", "content": "A short message"}]
+        protected_end = [{"role": "assistant", "content": "Final response message"}]
+        
+        media, uncomp, p_end, was_shed = filter_instance._enforce_context_limits(
+            protected_start, summary_message, media_messages, uncompressed, protected_end
+        )
+        
+        # With max_context_tokens=5, shedding should occur
+        assert was_shed is True
+
+    def test_enforce_context_limits_keeps_last_message(self, filter_instance):
+        """Test that at least one protected_end message is always kept."""
+        filter_instance.valves.max_context_tokens = 10  # Extremely low limit
+        
+        protected_start = [{"role": "system", "content": "System"}]
+        summary_message = None
+        media_messages = []
+        uncompressed = []
+        protected_end = [
+            {"role": "assistant", "content": "First final"},
+            {"role": "assistant", "content": "Second final"},
+        ]
+        
+        media, uncomp, p_end, was_shed = filter_instance._enforce_context_limits(
+            protected_start, summary_message, media_messages, uncompressed, protected_end
+        )
+        
+        # Should always keep at least one protected_end message
+        assert len(p_end) >= 1
+
+    def test_enforce_context_limits_zero_max_tokens(self, filter_instance):
+        """Test that zero max_tokens disables shedding."""
+        filter_instance.valves.max_context_tokens = 0
+        
+        protected_start = [{"role": "system", "content": "System"}]
+        summary_message = None
+        media_messages = []
+        uncompressed = [{"role": "user", "content": "Hello"}]
+        protected_end = [{"role": "assistant", "content": "Hi"}]
+        
+        media, uncomp, p_end, was_shed = filter_instance._enforce_context_limits(
+            protected_start, summary_message, media_messages, uncompressed, protected_end
+        )
+        
+        assert was_shed is False
+
+
+class TestBuildRuntimeStatsWithShed:
+    """Tests for _build_runtime_stats_message with was_shed parameter."""
+
+    def test_stats_message_without_shed(self, filter_instance):
+        """Test stats message without shedding."""
+        stats, total, prot, uncomp, summ, media = filter_instance._build_runtime_stats_message(
+            summarized_messages=[{"role": "user", "content": "old"}],
+            protected_messages=[{"role": "system", "content": "sys"}],
+            summary_message={"role": "system", "content": "summary"},
+            uncompressed_messages=[{"role": "user", "content": "new"}],
+            media_messages=[],
+            was_shed=False,
+        )
+        
+        assert "⚠️" not in stats
+        assert "🪙" in stats
+
+    def test_stats_message_with_shed(self, filter_instance):
+        """Test stats message includes warning when shedding occurred."""
+        stats, total, prot, uncomp, summ, media = filter_instance._build_runtime_stats_message(
+            summarized_messages=[],
+            protected_messages=[{"role": "system", "content": "sys"}],
+            summary_message=None,
+            uncompressed_messages=[{"role": "user", "content": "new"}],
+            media_messages=[],
+            was_shed=True,
+        )
+        
+        assert "⚠️ Limit Reached" in stats
+        assert "🪙" in stats
