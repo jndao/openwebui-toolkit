@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.1.0-dev.4
+version: 0.1.0-dev.5
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -1249,11 +1249,16 @@ class Filter:
         # Count the actual tokens sitting uncompressed in the DB
         db_uncompressed_tokens = self._count_tokens_in_messages(compressible_text_messages)
         
+        # Calculate effective tokens for the trigger ---
+        trigger_tokens = db_uncompressed_tokens
+        if self.valves.include_protected_in_threshold:
+            trigger_tokens += view.protected_tokens
+            
         self._debug_runtime_view(chat_id, "outlet-before", view, summary_state)
-
-        # Trigger based on db_uncompressed_tokens, not view.uncompressed_tokens
+        
+        # Trigger based on the calculated trigger_tokens
         if (
-            db_uncompressed_tokens > self.valves.compression_threshold_tokens
+            trigger_tokens > self.valves.compression_threshold_tokens
             and compressible_text_messages
         ):
             await self._emit_status(
