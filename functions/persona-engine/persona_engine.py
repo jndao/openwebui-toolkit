@@ -2,7 +2,7 @@
 title: Persona Engine
 author: jndao
 description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Persona natively within Open WebUI.
-version: 0.0.2-dev.2
+version: 0.0.2-dev.3
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -146,7 +146,7 @@ class ExtractorContract(BaseModel):
 
 class PersonaConsolidationContract(BaseModel):
     persona_summary: str = Field(
-        description="A highly detailed, comprehensive, and precise summary of the user, their current state, preferences, and traits, incorporating all new facts without losing past context."
+        description="The fully updated markdown archive following the exact STRUCTURE and RULES provided. Put the entire markdown text in this field."
     )
 
 
@@ -534,19 +534,34 @@ class Filter:
                             "Drop trivial details. DO NOT increase the overall length of the persona. Prioritize core psychological traits and infrastructure details."
                         )
 
-                    synth_system_prompt = (
-                        "You are an AI context manager optimizing a User Persona for maximum information density. "
-                        "You will be given the CURRENT PERSONA and a batch of NEW RAW MEMORY FACTS.\n\n"
-                        "INSTRUCTIONS:\n"
-                        "1. Update the CURRENT PERSONA to seamlessly incorporate ALL the new facts.\n"
-                        "2. CONTINUOUS RECONCILIATION: Deduplicate overlapping facts. If a new fact updates an old one, overwrite it.\n"
-                        "3. TELEGRAPHIC LANGUAGE: Use extreme brevity. Eliminate conversational filler, pleasantries, and redundant phrasing.\n"
-                        "4. HIERARCHICAL STRUCTURE: Use markdown bullet points, bold keywords, and categorized lists (e.g., **Infrastructure:**, **Traits:**) to organize data.\n"
-                        "5. ABSTRACTION: Group related micro-facts into broader traits to save space, but DO NOT lose specific technical details (like IP addresses or specific software names).\n\n"
-                        "Your goal is 100% fact retention with the absolute minimum token footprint."
-                        f"{compression_warning}"
-                    )
+                    synth_system_prompt = f"""
+You are the "Identity Synthesizer". Update the master User Persona archive using the newly extracted memory events. Replace the old persona entirely.
+### STRUCTURE (Keep exact order. Include all headers even if empty)
+## Core Identity & Verified Facts
+Hard data, demographics, and permanent traits. Include confidence %:
+- 90-100%: Verified/Established (e.g., career, family, core tech stack)
+- 70-89%: Strongly implied/Consistent behavior
+- 50-69%: Tentative/Fleeting interests
+- <50%: Omit entirely
 
+## Operating Principles & Preferences
+How the user makes decisions, their communication style, and UI/UX/formatting preferences. Replace superseded preferences.
+
+## Active Cognitive Load
+What the user is currently focused on, learning, or building. 
+
+## Deprecated Traits & Resolved Goals
+Old habits, abandoned projects, or changed opinions. (Note: Keep this brief; it serves as a tombstone before being purged as required).
+
+### RULES
+1. PRECEDENCE: New behavioral events overwrite old persona assumptions.
+2. NO PSYCHO-BABBLE: Do not psychoanalyze. State facts and observed patterns only.
+3. CONCISE: Bullet points only. Strip narrative filler and pleasantries.
+4. TERMINOLOGY: Preserve the user's exact phrasing for their beliefs and tools.
+5. FORMAT: Start directly with "## Core Identity & Verified Facts". No markdown fences.
+
+{compression_warning}
+"""
                     user_msg = f"CURRENT PERSONA:\n{current_persona_text}\n\nNEW RAW MEMORY FACTS TO MERGE:\n{facts_json}"
 
                     consolidation = await self._call_llm_native(
