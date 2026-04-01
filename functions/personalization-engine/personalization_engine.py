@@ -1,8 +1,8 @@
 """
-title: Persona Engine
+title: Personalization Engine
 author: jndao
-description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Persona natively within Open WebUI.
-version: 0.0.2-dev.3
+description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Profile natively within Open WebUI.
+version: 0.0.2-dev.4
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -27,13 +27,11 @@ from sqlalchemy import BigInteger, Column, String, Text
 
 logger = logging.getLogger(__name__)
 
-# --- Database Schema for Persona ---
-
+# --- Database Schema for Profile ---
 
 def _discover_owui_schema() -> Optional[str]:
     try:
         from open_webui.config import DATABASE_SCHEMA
-
         schema = (
             DATABASE_SCHEMA.value
             if hasattr(DATABASE_SCHEMA, "value")
@@ -43,12 +41,10 @@ def _discover_owui_schema() -> Optional[str]:
     except Exception:
         return None
 
-
 _owui_schema = _discover_owui_schema()
 
-
-class UserPersona(Base):
-    __tablename__ = "user_personas"
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
     __table_args__ = (
         {"extend_existing": True, "schema": _owui_schema}
         if _owui_schema
@@ -60,8 +56,7 @@ class UserPersona(Base):
     updated_at = Column(BigInteger, nullable=False)
     created_at = Column(BigInteger, nullable=False)
 
-
-class PersonaStore:
+class ProfileStore:
     def __init__(self):
         self._initialized = False
 
@@ -70,19 +65,19 @@ class PersonaStore:
             return True
         try:
             with get_db_context() as db:
-                UserPersona.__table__.create(bind=db.bind, checkfirst=True)
+                UserProfile.__table__.create(bind=db.bind, checkfirst=True)
                 db.commit()
             self._initialized = True
             return True
         except Exception as e:
-            logger.error(f"[Persona Engine] Failed to create user_personas table: {e}")
+            logger.error(f"[Personalization Engine] Failed to create user_profiles table: {e}")
             return False
 
-    def get_persona(self, user_id: str) -> Optional[Dict[str, Any]]:
+    def get_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
         self._ensure_table()
         try:
             with get_db_context() as db:
-                record = db.query(UserPersona).filter_by(user_id=user_id).first()
+                record = db.query(UserProfile).filter_by(user_id=user_id).first()
                 if record:
                     return {
                         "id": record.id,
@@ -92,20 +87,20 @@ class PersonaStore:
                     }
                 return None
         except Exception as e:
-            logger.error(f"[Persona Engine] Failed to get persona: {e}")
+            logger.error(f"[Personalization Engine] Failed to get profile: {e}")
             return None
 
-    def save_persona(self, user_id: str, content: str) -> bool:
+    def save_profile(self, user_id: str, content: str) -> bool:
         self._ensure_table()
         try:
             with get_db_context() as db:
-                record = db.query(UserPersona).filter_by(user_id=user_id).first()
+                record = db.query(UserProfile).filter_by(user_id=user_id).first()
                 now = int(time.time())
                 if record:
                     record.content = content
                     record.updated_at = now
                 else:
-                    record = UserPersona(
+                    record = UserProfile(
                         id=str(uuid.uuid4()),
                         user_id=user_id,
                         content=content,
@@ -116,14 +111,12 @@ class PersonaStore:
                 db.commit()
                 return True
         except Exception as e:
-            logger.error(f"[Persona Engine] Failed to save persona: {e}")
+            logger.error(f"[Personalization Engine] Failed to save profile: {e}")
             return False
 
-
-_persona_store = PersonaStore()
+_profile_store = ProfileStore()
 
 # --- Pydantic Contracts ---
-
 
 class MemoryObservation(BaseModel):
     category: Literal[
@@ -132,7 +125,6 @@ class MemoryObservation(BaseModel):
     content: str = Field(
         description="A clear, self-contained statement about the user starting with 'User...'."
     )
-
 
 class ExtractorContract(BaseModel):
     has_new_observations: bool = Field(
@@ -143,38 +135,34 @@ class ExtractorContract(BaseModel):
         description="List of new observations. Empty if has_new_observations is false.",
     )
 
-
-class PersonaConsolidationContract(BaseModel):
-    persona_summary: str = Field(
+class ProfileConsolidationContract(BaseModel):
+    profile_summary: str = Field(
         description="The fully updated markdown archive following the exact STRUCTURE and RULES provided. Put the entire markdown text in this field."
     )
 
-
 # --- Main Filter Class ---
-
 R = TypeVar("R", bound=BaseModel)
-
 
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=20, description="Filter execution order. Lower values run first."
         )
-        persona_model: str = Field(
+        engine_model: str = Field(
             default="",
-            description="Model ID for both extraction and persona synthesis. Leave blank to default to the current chat model.",
+            description="Model ID for both extraction and profile synthesis. Leave blank to default to the current chat model.",
         )
         consolidation_threshold: int = Field(
             default=5,
-            description="Number of engine memories to accumulate before triggering a persona reconsolidation.",
+            description="Number of engine memories to accumulate before triggering a profile reconsolidation.",
         )
-        max_persona_tokens: int = Field(
+        max_profile_tokens: int = Field(
             default=3000,
-            description="Maximum token length of the persona. If exceeded, the engine will aggressively compress older traits during synthesis to save context space.",
+            description="Maximum token length of the profile. If exceeded, the engine will aggressively compress older traits during synthesis to save context space.",
         )
         emit_status_events: bool = Field(
             default=True,
-            description="Toggle whether users should see UI status events during persona synthesis.",
+            description="Toggle whether users should see UI status events during profile synthesis.",
         )
         debug_logging: bool = Field(
             default=False, description="Enable detailed console logging."
@@ -184,14 +172,14 @@ class Filter:
         self.valves = self.Valves()
         self._locks: Dict[str, asyncio.Lock] = {}
         self.MAX_MEMORIES_PER_SYNTH = 50  # Safety chunking for big histories
-
+        
         # Tag used to namespace memories managed by the engine
-        self.ENGINE_TAG = "[PERSONA ENGINE]"
+        self.ENGINE_TAG = "[PERSONALIZATION ENGINE]"
 
     def _log(self, msg: str, level: str = "info"):
         if level == "debug" and not self.valves.debug_logging:
             return
-        getattr(logger, level, logger.info)(f"[Persona Engine] {msg}")
+        getattr(logger, level, logger.info)(f"[Personalization Engine] {msg}")
 
     def _lock_for(self, user_id: str) -> asyncio.Lock:
         if user_id not in self._locks:
@@ -204,7 +192,6 @@ class Filter:
             return 0
         try:
             import tiktoken
-
             # cl100k_base is the standard encoding for modern OpenAI and many open-source models
             encoding = tiktoken.get_encoding("cl100k_base")
             return len(encoding.encode(text))
@@ -244,13 +231,11 @@ class Filter:
     ) -> Optional[R]:
         """Calls the LLM using Open WebUI's native router and forces JSON output."""
         schema_json = json.dumps(response_model.model_json_schema())
-
         enforced_prompt = (
             f"{system_prompt}\n\n"
             f"Return ONLY valid JSON matching this schema. Do NOT wrap the response in markdown blocks. "
             f"Output raw JSON text directly.\n{schema_json}"
         )
-
         payload = {
             "model": model_id,
             "messages": [
@@ -260,16 +245,13 @@ class Filter:
             "stream": False,
             "temperature": 0.0,  # Zero temperature for maximum determinism and precision
         }
-
         try:
             response = await generate_chat_completion(request, payload, user)
             if hasattr(response, "body"):
                 response_data = json.loads(response.body.decode())
             else:
                 response_data = response
-
             content = response_data["choices"][0]["message"]["content"].strip()
-
             try:
                 return response_model.model_validate_json(content)
             except Exception as parse_err:
@@ -278,7 +260,6 @@ class Filter:
                     "error",
                 )
                 raise ValueError("LLM did not return valid JSON.")
-
         except Exception as e:
             self._log(f"Native LLM call failed: {e}", "error")
             return None
@@ -292,19 +273,17 @@ class Filter:
         __request__: Optional[Request] = None,
         __event_emitter__: Optional[Callable] = None,
     ) -> dict:
-        """Injects the Persona and any pending memories into the system prompt before the LLM sees it."""
+        """Injects the Profile and any pending memories into the system prompt before the LLM sees it."""
         if not __user__ or "messages" not in body:
             return body
-
         user_id = __user__.get("id")
         if not user_id:
             return body
-
         try:
-            # Fetch the main persona
-            persona_data = await asyncio.to_thread(_persona_store.get_persona, user_id)
-            persona_text = persona_data.get("content") if persona_data else None
-
+            # Fetch the main profile
+            profile_data = await asyncio.to_thread(_profile_store.get_profile, user_id)
+            profile_text = profile_data.get("content") if profile_data else None
+            
             # Fetch any pending (unprocessed) memories
             all_memories = await asyncio.to_thread(
                 Memories.get_memories_by_user_id, user_id
@@ -314,45 +293,52 @@ class Filter:
                 for m in all_memories
                 if m.content.startswith(self.ENGINE_TAG)
             ]
-
-            if persona_text or pending_memories:
-                injection = "<user_persona>\n"
-
-                if persona_text:
-                    injection += f"{persona_text}\n"
-
+            
+            if profile_text or pending_memories:
+                # 1. Explicit framing to prevent AI roleplay
+                injection = (
+                    "BACKGROUND CONTEXT ABOUT THE HUMAN USER:\n"
+                    "The following information describes the person you are speaking with. "
+                    "You are the AI assistant. DO NOT adopt this profile as your own identity. "
+                    "Use this context strictly to tailor your answers to the user's expertise, preferences, and current state.\n\n"
+                    "<user_profile>\n"
+                )
+                
+                if profile_text:
+                    injection += f"{profile_text}\n"
+                
                 if pending_memories:
-                    injection += "\n<pending_updates>\n"
+                    injection += "\n<recent_user_events>\n"
                     for m in pending_memories:
                         injection += f"- {m}\n"
-                    injection += "</pending_updates>\n"
-
+                    injection += "</recent_user_events>\n"
+                
+                # 2. Strong closing reinforcement
                 injection += (
-                    "</user_persona>\nKeep this persona in mind when responding."
+                    "</user_profile>\n"
+                    "Remember: The profile above describes the user. Adapt your communication style to suit them."
                 )
-
+                
                 # Insert at the very beginning of the context
                 body["messages"].insert(0, {"role": "system", "content": injection})
-
+                
                 self._log(
-                    f"Injected Persona and {len(pending_memories)} pending memories for user {user_id}.",
+                    f"Injected User Profile and {len(pending_memories)} pending memories for user {user_id}.",
                     "debug",
                 )
                 await self._emit_status(
                     __event_emitter__,
-                    "👤 Persona Engine: Injected Persona Context",
+                    "⚙️ Personalization Engine: Injected User Profile",
                     done=True,
                 )
             else:
                 await self._emit_status(
                     __event_emitter__,
-                    "👤 Persona Engine: No Persona established yet",
+                    "⚙️ Personalization Engine: No Profile established yet",
                     done=True,
                 )
-
         except Exception as e:
             self._log(f"Error in inlet: {e}", "error")
-
         return body
 
     async def outlet(
@@ -365,14 +351,12 @@ class Filter:
         """Spawns the background engine after the chat turn is complete."""
         if not __user__ or "messages" not in body:
             return body
-
         user_id = __user__.get("id")
         if not user_id:
             return body
-
         chat_model = body.get("model", "")
         messages = body["messages"]
-
+        
         # Fire and forget the background task
         asyncio.create_task(
             self._process_turn_async(
@@ -383,7 +367,6 @@ class Filter:
                 emitter=__event_emitter__,
             )
         )
-
         return body
 
     # --- Background Engine ---
@@ -399,46 +382,44 @@ class Filter:
         """The background engine: Extracts, checks state, and potentially reconsolidates."""
         if len(messages) < 1:
             return
-
         user_id = user_data["id"]
         user = await asyncio.to_thread(Users.get_user_by_id, user_id)
         if not user:
             return
-
         lock = self._lock_for(user_id)
         async with lock:
             try:
                 # Determine the model to use for the engine operations
-                engine_model = self.valves.persona_model or chat_model
-
-                # 1. FETCH FULL CONTEXT (Persona + Pending Memories)
-                persona_data = await asyncio.to_thread(
-                    _persona_store.get_persona, user_id
+                engine_model = self.valves.engine_model or chat_model
+                
+                # 1. FETCH FULL CONTEXT (Profile + Pending Memories)
+                profile_data = await asyncio.to_thread(
+                    _profile_store.get_profile, user_id
                 )
-                current_persona_text = (
-                    persona_data["content"]
-                    if persona_data
-                    else "No persona exists yet."
+                current_profile_text = (
+                    profile_data["content"]
+                    if profile_data
+                    else "No profile exists yet."
                 )
-
+                
                 all_memories = await asyncio.to_thread(
                     Memories.get_memories_by_user_id, user_id
                 )
                 if all_memories is None:
                     all_memories = []
-
+                    
                 engine_memories = [
                     m for m in all_memories if m.content.startswith(self.ENGINE_TAG)
                 ]
-
-                pending_text = "No pending memories."
+                
+                pending_text = "No pending events."
                 if engine_memories:
                     pending_list = [
                         m.content.replace(f"{self.ENGINE_TAG} ", "", 1)
                         for m in engine_memories
                     ]
                     pending_text = "\n".join([f"- {m}" for m in pending_list])
-
+                    
                 # 2. EXTRACTION (Differential)
                 last_messages = "\n".join(
                     [
@@ -446,18 +427,18 @@ class Filter:
                         for m in messages[-3:]
                     ]
                 )
-
+                
                 extractor_system_prompt = (
-                    "You are a real-time psychological observer. Analyze the user's latest message for personal concepts (facts, preferences, emotional states, goals).\n\n"
-                    f"CURRENT PERSONA:\n{current_persona_text}\n\n"
-                    f"PENDING UNPROCESSED MEMORIES:\n{pending_text}\n\n"
+                    "You are a real-time context observer. Analyze the user's latest message for personal concepts (facts, preferences, emotional states, goals).\n\n"
+                    f"CURRENT USER PROFILE:\n{current_profile_text}\n\n"
+                    f"RECENT UNPROCESSED EVENTS:\n{pending_text}\n\n"
                     "INSTRUCTIONS:\n"
-                    "1. Compare the user's message against BOTH the CURRENT PERSONA and the PENDING UNPROCESSED MEMORIES.\n"
-                    "2. ONLY extract observations that are NEW, add SIGNIFICANT DETAIL, or CORRECT existing information.\n"
-                    "3. Ignore transient statements or things already well-covered in the persona or pending memories.\n"
+                    "1. Compare the user's message against BOTH the CURRENT USER PROFILE and the RECENT UNPROCESSED EVENTS.\n"
+                    "2. ONLY extract observations that are NEW, add SIGNIFICANT DETAIL, or CORRECT existing information about the human user.\n"
+                    "3. Ignore transient statements or things already well-covered in the profile or pending events.\n"
                     "4. Every observation MUST start with 'User...'.\n"
                 )
-
+                
                 self._log(f"Running Extractor using {engine_model}...", "debug")
                 extraction = await self._call_llm_native(
                     request,
@@ -467,7 +448,7 @@ class Filter:
                     last_messages,
                     ExtractorContract,
                 )
-
+                
                 if (
                     extraction
                     and extraction.has_new_observations
@@ -488,14 +469,14 @@ class Filter:
                                 {"id": "temp", "content": tagged_content},
                             )
                         )
-
+                        
                     # Emit exact number of memories saved
                     await self._emit_status(
                         emitter,
-                        f"📝 Persona Engine: Saved {len(extraction.observations)} new memories.",
+                        f"📝 Personalization Engine: Saved {len(extraction.observations)} new events.",
                         done=True,
                     )
-
+                    
                 # 3. RECONSOLIDATION (Self-Healing Chunking & Purge)
                 if len(engine_memories) >= self.valves.consolidation_threshold:
                     self._log(
@@ -504,38 +485,39 @@ class Filter:
                     )
                     await self._emit_status(
                         emitter,
-                        "🧠 Persona Engine: Synthesizing Persona...",
+                        "🧠 Personalization Engine: Synthesizing Profile...",
                         done=False,
                     )
-
+                    
                     # Safety chunking: Take the oldest MAX_MEMORIES_PER_SYNTH
                     batch = engine_memories[: self.MAX_MEMORIES_PER_SYNTH]
-
+                    
                     # Strip the tag before sending to LLM so it reads naturally
                     clean_facts = [
                         {"content": m.content.replace(f"{self.ENGINE_TAG} ", "", 1)}
                         for m in batch
                     ]
                     facts_json = json.dumps(clean_facts, indent=2)
-
+                    
                     # Check token safety limit
-                    current_tokens = self._count_tokens(current_persona_text)
-                    is_bloated = current_tokens > self.valves.max_persona_tokens
-
+                    current_tokens = self._count_tokens(current_profile_text)
+                    is_bloated = current_tokens > self.valves.max_profile_tokens
+                    
                     compression_warning = ""
                     if is_bloated:
                         self._log(
-                            f"Persona tokens ({current_tokens}) exceeds maximum ({self.valves.max_persona_tokens}). Triggering Deep Compression.",
+                            f"Profile tokens ({current_tokens}) exceeds maximum ({self.valves.max_profile_tokens}). Triggering Deep Compression.",
                             "warning",
                         )
                         compression_warning = (
-                            f"\n\n[CRITICAL WARNING: MAXIMUM TOKEN LIMIT REACHED ({current_tokens}/{self.valves.max_persona_tokens})]\n"
-                            "The current persona is too long. You MUST aggressively compress older, related traits into denser abstractions to make room for the new facts. "
-                            "Drop trivial details. DO NOT increase the overall length of the persona. Prioritize core psychological traits and infrastructure details."
+                            f"\n\n[CRITICAL WARNING: MAXIMUM TOKEN LIMIT REACHED ({current_tokens}/{self.valves.max_profile_tokens})]\n"
+                            "The current profile is too long. You MUST aggressively compress older, related traits into denser abstractions to make room for the new facts. "
+                            "Drop trivial details. DO NOT increase the overall length of the profile. Prioritize core psychological traits and infrastructure details."
                         )
-
+                        
                     synth_system_prompt = f"""
-You are the "Identity Synthesizer". Update the master User Persona archive using the newly extracted memory events. Replace the old persona entirely.
+You are the "Identity Synthesizer". Update the master User Profile archive using the newly extracted memory events. Replace the old profile entirely.
+
 ### STRUCTURE (Keep exact order. Include all headers even if empty)
 ## Core Identity & Verified Facts
 Hard data, demographics, and permanent traits. Include confidence %:
@@ -554,34 +536,34 @@ What the user is currently focused on, learning, or building.
 Old habits, abandoned projects, or changed opinions. (Note: Keep this brief; it serves as a tombstone before being purged as required).
 
 ### RULES
-1. PRECEDENCE: New behavioral events overwrite old persona assumptions.
-2. NO PSYCHO-BABBLE: Do not psychoanalyze. State facts and observed patterns only.
+1. PRECEDENCE: New behavioral events overwrite old profile assumptions.
+2. NO ROLEPLAY: You are analyzing the user. Do not adopt this profile as yourself.
 3. CONCISE: Bullet points only. Strip narrative filler and pleasantries.
 4. TERMINOLOGY: Preserve the user's exact phrasing for their beliefs and tools.
 5. FORMAT: Start directly with "## Core Identity & Verified Facts". No markdown fences.
 
 {compression_warning}
 """
-                    user_msg = f"CURRENT PERSONA:\n{current_persona_text}\n\nNEW RAW MEMORY FACTS TO MERGE:\n{facts_json}"
-
+                    user_msg = f"CURRENT USER PROFILE:\n{current_profile_text}\n\nNEW RAW MEMORY FACTS TO MERGE:\n{facts_json}"
+                    
                     consolidation = await self._call_llm_native(
                         request,
                         user,
                         engine_model,
                         synth_system_prompt,
                         user_msg,
-                        PersonaConsolidationContract,
+                        ProfileConsolidationContract,
                     )
-
-                    if consolidation and consolidation.persona_summary:
+                    
+                    if consolidation and consolidation.profile_summary:
                         success = await asyncio.to_thread(
-                            _persona_store.save_persona,
+                            _profile_store.save_profile,
                             user_id,
-                            consolidation.persona_summary,
+                            consolidation.profile_summary,
                         )
                         if success:
-                            self._log("Persona updated successfully.", "info")
-
+                            self._log("Profile updated successfully.", "info")
+                            
                             # The Purge: Delete the processed batch entirely to keep the memory list clean
                             # Note: We skip 'temp' IDs which were just added in this turn to avoid DB errors,
                             # they will be processed in the next synthesis cycle.
@@ -592,24 +574,24 @@ Old habits, abandoned projects, or changed opinions. (Note: Keep this brief; it 
                                     m.id,
                                     user_id,
                                 )
-
+                                
                             # Emit exact number of memories incorporated
                             await self._emit_status(
                                 emitter,
-                                f"✨ Persona Engine: Incorporated {len(valid_batch)} memories into Persona!",
+                                f"✨ Personalization Engine: Incorporated {len(valid_batch)} events into Profile!",
                                 done=True,
                             )
                         else:
                             await self._emit_status(
-                                emitter, "⚠️ Failed to save Persona.", done=True
+                                emitter, "⚠️ Failed to save Profile.", done=True
                             )
                     else:
                         await self._emit_status(
-                            emitter, "⚠️ Persona synthesis failed.", done=True
+                            emitter, "⚠️ Profile synthesis failed.", done=True
                         )
-
+                        
             except Exception as e:
                 self._log(f"Background processing failed: {e}", "error")
                 await self._emit_status(
-                    emitter, f"⚠️ Persona Engine Error: {str(e)[:50]}", done=True
+                    emitter, f"⚠️ Personalization Engine Error: {str(e)[:50]}", done=True
                 )
