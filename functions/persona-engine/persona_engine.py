@@ -2,7 +2,7 @@
 title: Persona Engine
 author: jndao
 description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Persona natively within Open WebUI.
-version: 0.0.2-dev.1
+version: 0.0.2-dev.2
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -535,9 +535,15 @@ class Filter:
                         )
 
                     synth_system_prompt = (
-                        "You are a master psychological profiler. You will be given the user's CURRENT PERSONA and a batch of new RAW MEMORY FACTS.\n"
-                        "Update the CURRENT PERSONA to seamlessly incorporate ALL the new facts. "
-                        "Ensure the resulting profile is highly comprehensive, extremely precise, and well-structured."
+                        "You are an AI context manager optimizing a User Persona for maximum information density. "
+                        "You will be given the CURRENT PERSONA and a batch of NEW RAW MEMORY FACTS.\n\n"
+                        "INSTRUCTIONS:\n"
+                        "1. Update the CURRENT PERSONA to seamlessly incorporate ALL the new facts.\n"
+                        "2. CONTINUOUS RECONCILIATION: Deduplicate overlapping facts. If a new fact updates an old one, overwrite it.\n"
+                        "3. TELEGRAPHIC LANGUAGE: Use extreme brevity. Eliminate conversational filler, pleasantries, and redundant phrasing.\n"
+                        "4. HIERARCHICAL STRUCTURE: Use markdown bullet points, bold keywords, and categorized lists (e.g., **Infrastructure:**, **Traits:**) to organize data.\n"
+                        "5. ABSTRACTION: Group related micro-facts into broader traits to save space, but DO NOT lose specific technical details (like IP addresses or specific software names).\n\n"
+                        "Your goal is 100% fact retention with the absolute minimum token footprint."
                         f"{compression_warning}"
                     )
 
