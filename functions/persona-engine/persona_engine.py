@@ -2,7 +2,7 @@
 title: Persona Engine
 author: jndao
 description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Persona natively within Open WebUI.
-version: 0.0.1-dev.12
+version: 0.0.1
 required_open_webui_version: >= 0.8.12
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
