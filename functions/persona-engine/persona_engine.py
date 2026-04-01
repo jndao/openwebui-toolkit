@@ -1,9 +1,13 @@
 """
 title: Persona Engine
-author: YourName
-description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a cohesive User Persona natively within Open WebUI.
-version: 0.0.1-dev.4
-required_open_webui_version: >= 0.5.0
+author: jndao
+description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Persona natively within Open WebUI.
+version: 0.0.1-dev.10
+required_open_webui_version: >= 0.8.12
+author_url: https://github.com/jndao
+repository_url: https://github.com/jndao/openwebui-toolkit
+funding_url: https://ko-fi.com/jndao
+license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
 """
 
 import asyncio
@@ -130,7 +134,7 @@ class ExtractorContract(BaseModel):
 
 class PersonaConsolidationContract(BaseModel):
     persona_summary: str = Field(
-        description="A cohesive 1-2 paragraph summary of the user, their current state, and preferences incorporating all new facts."
+        description="A highly detailed, comprehensive, and precise summary of the user, their current state, preferences, and traits, incorporating all new facts without losing past context."
     )
 
 # --- Main Filter Class ---
@@ -139,13 +143,13 @@ R = TypeVar("R", bound=BaseModel)
 
 class Filter:
     class Valves(BaseModel):
-        extractor_model: str = Field(
-            default="", 
-            description="Model ID for extraction. Leave blank to default to the current chat model."
+        priority: int = Field(
+            default=20,
+            description="Filter execution order. Lower values run first."
         )
-        synthesizer_model: str = Field(
+        persona_model: str = Field(
             default="", 
-            description="Model ID for persona synthesis. Leave blank to default to the current chat model."
+            description="Model ID for both extraction and persona synthesis. Leave blank to default to the current chat model."
         )
         consolidation_threshold: int = Field(
             default=5, 
@@ -211,7 +215,7 @@ class Filter:
                 {"role": "user", "content": user_message},
             ],
             "stream": False,
-            "temperature": 0.1,
+            "temperature": 0.0, # Zero temperature for maximum determinism and precision
         }
         
         try:
@@ -242,7 +246,7 @@ class Filter:
         __request__: Optional[Request] = None,
         __event_emitter__: Optional[Callable] = None
     ) -> dict:
-        """Injects the Persona into the system prompt before the LLM sees it."""
+        """Injects the Persona and any pending memories into the system prompt before the LLM sees it."""
         if not __user__ or "messages" not in body:
             return body
 
@@ -251,15 +255,36 @@ class Filter:
             return body
 
         try:
+            # Fetch the main persona
             persona_data = await asyncio.to_thread(_persona_store.get_persona, user_id)
-            if persona_data and persona_data.get("content"):
-                persona_msg = {
-                    "role": "system",
-                    "content": f"<user_persona>\n{persona_data['content']}\n</user_persona>\nKeep this persona in mind when responding."
-                }
-                body["messages"].insert(0, persona_msg)
-                self._log(f"Injected Persona for user {user_id}.", "debug")
-                await self._emit_status(__event_emitter__, "👤 Persona Engine: Injected Persona", done=True)
+            persona_text = persona_data.get("content") if persona_data else None
+
+            # Fetch any pending (unprocessed) memories
+            all_memories = await asyncio.to_thread(Memories.get_memories_by_user_id, user_id)
+            pending_memories = [
+                m.content.replace(f"{self.ENGINE_TAG} ", "", 1) 
+                for m in all_memories if m.content.startswith(self.ENGINE_TAG)
+            ]
+
+            if persona_text or pending_memories:
+                injection = "<user_persona>\n"
+                
+                if persona_text:
+                    injection += f"{persona_text}\n"
+                
+                if pending_memories:
+                    injection += "\n<pending_updates>\n"
+                    for m in pending_memories:
+                        injection += f"- {m}\n"
+                    injection += "</pending_updates>\n"
+                
+                injection += "</user_persona>\nKeep this persona in mind when responding."
+                
+                # Insert at the very beginning of the context
+                body["messages"].insert(0, {"role": "system", "content": injection})
+                
+                self._log(f"Injected Persona and {len(pending_memories)} pending memories for user {user_id}.", "debug")
+                await self._emit_status(__event_emitter__, "👤 Persona Engine: Injected Persona Context", done=True)
             else:
                 await self._emit_status(__event_emitter__, "👤 Persona Engine: No Persona established yet", done=True)
                 
@@ -321,20 +346,41 @@ class Filter:
         lock = self._lock_for(user_id)
         async with lock:
             try:
-                # 1. EXTRACTION
-                extractor_model = self.valves.extractor_model or chat_model
+                # Determine the model to use for the engine operations
+                engine_model = self.valves.persona_model or chat_model
+
+                # 1. FETCH FULL CONTEXT (Persona + Pending Memories)
+                persona_data = await asyncio.to_thread(_persona_store.get_persona, user_id)
+                current_persona_text = persona_data["content"] if persona_data else "No persona exists yet."
+
+                all_memories = await asyncio.to_thread(Memories.get_memories_by_user_id, user_id)
+                if all_memories is None:
+                    all_memories = []
+                    
+                engine_memories = [m for m in all_memories if m.content.startswith(self.ENGINE_TAG)]
+                
+                pending_text = "No pending memories."
+                if engine_memories:
+                    pending_list = [m.content.replace(f"{self.ENGINE_TAG} ", "", 1) for m in engine_memories]
+                    pending_text = "\n".join([f"- {m}" for m in pending_list])
+
+                # 2. EXTRACTION (Differential)
                 last_messages = "\n".join([f"{m.get('role', 'user').upper()}: {m.get('content', '')}" for m in messages[-3:]])
                 
                 extractor_system_prompt = (
-                    "You are a real-time psychological observer. Analyze the user's latest message for new, "
-                    "long-term relevant personal concepts (facts, preferences, emotional states, goals). "
-                    "Ignore transient statements. Every observation MUST start with 'User...'. "
-                    "Do not worry about contradictions with the past."
+                    "You are a real-time psychological observer. Analyze the user's latest message for personal concepts (facts, preferences, emotional states, goals).\n\n"
+                    f"CURRENT PERSONA:\n{current_persona_text}\n\n"
+                    f"PENDING UNPROCESSED MEMORIES:\n{pending_text}\n\n"
+                    "INSTRUCTIONS:\n"
+                    "1. Compare the user's message against BOTH the CURRENT PERSONA and the PENDING UNPROCESSED MEMORIES.\n"
+                    "2. ONLY extract observations that are NEW, add SIGNIFICANT DETAIL, or CORRECT existing information.\n"
+                    "3. Ignore transient statements or things already well-covered in the persona or pending memories.\n"
+                    "4. Every observation MUST start with 'User...'.\n"
                 )
                 
-                self._log(f"Running Extractor using {extractor_model}...", "debug")
+                self._log(f"Running Extractor using {engine_model}...", "debug")
                 extraction = await self._call_llm_native(
-                    request, user, extractor_model, extractor_system_prompt, last_messages, ExtractorContract
+                    request, user, engine_model, extractor_system_prompt, last_messages, ExtractorContract
                 )
                 
                 if extraction and extraction.has_new_observations and extraction.observations:
@@ -343,29 +389,20 @@ class Filter:
                         tagged_content = f"{self.ENGINE_TAG} {obs.content}"
                         await asyncio.to_thread(Memories.insert_new_memory, user_id, tagged_content)
                         self._log(f"Added engine memory: {obs.content}", "info")
+                        # Add to our local list so the threshold check below is accurate
+                        engine_memories.append(type('obj', (object,), {'id': 'temp', 'content': tagged_content}))
                     
+                    # Emit exact number of memories saved
                     await self._emit_status(
                         emitter, 
-                        f"📝 Persona Engine: Saved {len(extraction.observations)} new observations", 
+                        f"📝 Persona Engine: Saved {len(extraction.observations)} new memories.", 
                         done=True
                     )
-
-                # 2. STATE CHECK (Filter for Sandboxed Memories)
-                all_memories = await asyncio.to_thread(Memories.get_memories_by_user_id, user_id)
-                if not all_memories:
-                    return
-
-                # Only look at memories we manage
-                engine_memories = [m for m in all_memories if m.content.startswith(self.ENGINE_TAG)]
 
                 # 3. RECONSOLIDATION (Self-Healing Chunking & Purge)
                 if len(engine_memories) >= self.valves.consolidation_threshold:
                     self._log(f"Threshold reached ({len(engine_memories)} engine memories). Triggering Synthesizer...", "info")
                     await self._emit_status(emitter, "🧠 Persona Engine: Synthesizing Persona...", done=False)
-                    
-                    synthesizer_model = self.valves.synthesizer_model or chat_model
-                    persona_data = await asyncio.to_thread(_persona_store.get_persona, user_id)
-                    current_persona_text = persona_data["content"] if persona_data else "No persona exists yet."
                     
                     # Safety chunking: Take the oldest MAX_MEMORIES_PER_SYNTH
                     batch = engine_memories[:self.MAX_MEMORIES_PER_SYNTH]
@@ -377,13 +414,14 @@ class Filter:
                     synth_system_prompt = (
                         "You are a master psychological profiler. You will be given the user's CURRENT PERSONA and a batch of new RAW MEMORY FACTS.\n"
                         "Update the CURRENT PERSONA to seamlessly incorporate ALL the new facts. "
-                        "Return ONLY the updated 1-2 paragraph cohesive USER PERSONA."
+                        "Ensure the resulting profile is highly comprehensive, extremely precise, and well-structured. "
+                        "Do not limit your output length; capture all nuances, preferences, emotional states, and goals accurately."
                     )
                     
                     user_msg = f"CURRENT PERSONA:\n{current_persona_text}\n\nNEW RAW MEMORY FACTS TO MERGE:\n{facts_json}"
                     
                     consolidation = await self._call_llm_native(
-                        request, user, synthesizer_model, synth_system_prompt, user_msg, PersonaConsolidationContract
+                        request, user, engine_model, synth_system_prompt, user_msg, PersonaConsolidationContract
                     )
                     
                     if consolidation and consolidation.persona_summary:
@@ -392,10 +430,18 @@ class Filter:
                             self._log("Persona updated successfully.", "info")
                             
                             # The Purge: Delete the processed batch entirely to keep the memory list clean
-                            for m in batch:
+                            # Note: We skip 'temp' IDs which were just added in this turn to avoid DB errors, 
+                            # they will be processed in the next synthesis cycle.
+                            valid_batch = [m for m in batch if m.id != 'temp']
+                            for m in valid_batch:
                                 await asyncio.to_thread(Memories.delete_memory_by_id_and_user_id, m.id, user_id)
                             
-                            await self._emit_status(emitter, "✨ Persona updated successfully!", done=True)
+                            # Emit exact number of memories incorporated
+                            await self._emit_status(
+                                emitter, 
+                                f"✨ Persona Engine: Incorporated {len(valid_batch)} memories into Persona!", 
+                                done=True
+                            )
                         else:
                             await self._emit_status(emitter, "⚠️ Failed to save Persona.", done=True)
                     else:
