@@ -2,7 +2,7 @@
 title: Persona Engine
 author: jndao
 description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Persona natively within Open WebUI.
-version: 0.0.1-dev.10
+version: 0.0.1-dev.12
 required_open_webui_version: >= 0.8.12
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
@@ -152,12 +152,12 @@ class Filter:
             description="Model ID for both extraction and persona synthesis. Leave blank to default to the current chat model."
         )
         consolidation_threshold: int = Field(
-            default=5, 
+            default=10, 
             description="Number of engine memories to accumulate before triggering a persona reconsolidation."
         )
         emit_status_events: bool = Field(
-            default=True,
-            description="Toggle whether users should see UI status events during persona synthesis."
+            default=False,
+            description="Toggle whether users should see UI status events during normal persona operations. Errors will always emit."
         )
         debug_logging: bool = Field(
             default=False, 
@@ -182,9 +182,13 @@ class Filter:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
 
-    async def _emit_status(self, emitter: Optional[Callable], message: str, done: bool = True):
-        if emitter is None or not self.valves.emit_status_events:
+    async def _emit_status(self, emitter: Optional[Callable], message: str, done: bool = True, is_error: bool = False):
+        if emitter is None:
             return
+        # If it's not an error and the user has disabled status events, stay quiet.
+        if not self.valves.emit_status_events and not is_error:
+            return
+            
         try:
             await emitter({"type": "status", "data": {"description": message, "done": done}})
         except Exception as e:
@@ -443,10 +447,10 @@ class Filter:
                                 done=True
                             )
                         else:
-                            await self._emit_status(emitter, "⚠️ Failed to save Persona.", done=True)
+                            await self._emit_status(emitter, "⚠️ Failed to save Persona.", done=True, is_error=True)
                     else:
-                        await self._emit_status(emitter, "⚠️ Persona synthesis failed.", done=True)
+                        await self._emit_status(emitter, "⚠️ Persona synthesis failed.", done=True, is_error=True)
 
             except Exception as e:
                 self._log(f"Background processing failed: {e}", "error")
-                await self._emit_status(emitter, f"⚠️ Persona Engine Error: {str(e)[:50]}", done=True)
+                await self._emit_status(emitter, f"⚠️ Persona Engine Error: {str(e)[:50]}", done=True, is_error=True)
