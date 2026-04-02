@@ -1,8 +1,8 @@
 """
 title: Personalization Engine
 author: jndao
-description: A two-tier memory system. Extracts real-time observations, safely tags them, and periodically synthesizes a comprehensive User Profile natively within Open WebUI.
-version: 0.0.2-dev.5
+description: A two-tier memory system that autonomously extracts user observations and synthesizes them into a high-density, structured User Profile.
+version: 0.0.2
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
