@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.1.1-dev.3
+version: 0.1.1-dev.4
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -769,32 +769,36 @@ class Filter:
                     return True
         return False
 
-    def _align_messages(
-        self, db_msgs: List[Dict[str, Any]], body_msgs: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+    def _align_messages(self, db_msgs: List[Dict[str, Any]], body_msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
+        db_msgs is the canonical chronological history (contains all messages and timestamps).
         body_msgs contains the fully hydrated base64 images from OpenWebUI.
-        db_msgs contains the timestamps.
-        We align them from newest to oldest to inject timestamps into the rich body messages.
+        We map the hydrated media from body_msgs onto db_msgs to preserve media without losing history.
         """
-        aligned = deepcopy(body_msgs)
-        db_idx = len(db_msgs) - 1
-        body_idx = len(aligned) - 1
-
-        while body_idx >= 0 and db_idx >= 0:
-            b_msg = aligned[body_idx]
-            d_msg = db_msgs[db_idx]
-
-            if b_msg.get("role") == d_msg.get("role"):
-                ts = self._timestamp_of(d_msg)
-                if ts is not None:
-                    b_msg["timestamp"] = ts
+        aligned = deepcopy(db_msgs)
+        db_idx = len(aligned) - 1
+        body_idx = len(body_msgs) - 1
+        
+        while db_idx >= 0 and body_idx >= 0:
+            d_msg = aligned[db_idx]
+            b_msg = body_msgs[body_idx]
+            
+            # Skip injected system messages in body_msgs (like the Context Manager summary)
+            if b_msg.get("role") == "system" and d_msg.get("role") != "system":
+                body_idx -= 1
+                continue
+                
+            if d_msg.get("role") == b_msg.get("role"):
+                # If the frontend message contains multimodal media, overlay it onto the DB message
+                if isinstance(b_msg.get("content"), list) or self._message_has_passthrough_media(b_msg):
+                    d_msg["content"] = deepcopy(b_msg.get("content"))
                 db_idx -= 1
                 body_idx -= 1
             else:
-                # Mismatch (e.g., system prompt injected by frontend). Skip body message.
-                body_idx -= 1
-
+                # Mismatch: db_msgs has older history that body_msgs lacks (e.g., in the outlet).
+                # Advance db_idx to find the next matching message.
+                db_idx -= 1
+                
         return aligned
 
     def _build_media_only_message(
