@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
-version: 0.2.0-dev.7
+version: 0.2.0-dev.12
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -106,28 +106,19 @@ def extract_base64_data(image_url: str) -> Tuple[Optional[str], Optional[str], s
     if image_url.startswith("data:image/"):
         match = re.match(r"data:image/([^;]+);base64,(.+)", image_url)
         if match:
-            mime_type = match.group(1).lower()
-            base64_data = match.group(2)
-            fmt = mime_type.replace("jpg", "jpeg")
-            return base64_data, fmt, image_url
+            return (
+                match.group(2),
+                match.group(1).lower().replace("jpg", "jpeg"),
+                image_url,
+            )
     if re.match(r"^[A-Za-z0-9+/=]+$", image_url.strip()):
-        fmt = detect_image_format(image_url)
-        return image_url.strip(), fmt, image_url
+        return image_url.strip(), detect_image_format(image_url), image_url
     return None, None, image_url
 
 
 def calculate_base64_size(base64_data: str) -> int:
     clean_data = base64_data.replace("\n", "").replace("\r", "").strip()
-    padding = clean_data.count("=")
-    return (len(clean_data) * 3) // 4 - padding
-
-
-def format_size(size_bytes: int) -> str:
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f}{unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f}TB"
+    return (len(clean_data) * 3) // 4 - clean_data.count("=")
 
 
 def format_tokens(token_count: int) -> str:
@@ -141,22 +132,24 @@ def format_tokens(token_count: int) -> str:
 def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
     if not model:
         return True
-    capabilities = model.get("info", {}).get("meta", {}).get("capabilities", {})
-    if capabilities is not None and "vision" in capabilities:
-        return bool(capabilities["vision"])
-    return True
+    return bool(
+        model.get("info", {})
+        .get("meta", {})
+        .get("capabilities", {})
+        .get("vision", True)
+    )
 
 
 def extract_text_from_image(base64_data: str) -> Optional[str]:
     if not RAPIDOCR_AVAILABLE or _ocr_engine is None:
         return None
     try:
-        image_bytes = base64.b64decode(base64_data)
-        result, _ = _ocr_engine(image_bytes)
-        if result is None or len(result) == 0:
+        result, _ = _ocr_engine(base64.b64decode(base64_data))
+        if not result:
             return None
-        text_lines = [line[1] for line in result if len(line) >= 2 and line[1]]
-        text = " ".join(text_lines).strip()
+        text = " ".join(
+            [line[1] for line in result if len(line) >= 2 and line[1]]
+        ).strip()
         return text if text else None
     except Exception:
         return None
@@ -164,8 +157,7 @@ def extract_text_from_image(base64_data: str) -> Optional[str]:
 
 def generate_smart_image_description(base64_data: str, use_ocr: bool = True) -> str:
     if use_ocr and RAPIDOCR_AVAILABLE:
-        ocr_text = extract_text_from_image(base64_data)
-        if ocr_text:
+        if ocr_text := extract_text_from_image(base64_data):
             return f"[OCR Text]: {ocr_text}"
     return "[Image content not available - could not extract description]"
 
@@ -178,16 +170,12 @@ def estimate_image_tokens_from_dimensions(
     if detail == "low":
         return 85
     max_dim = max(width, height)
-    scale = 1.0
-    if max_dim > 2048:
-        scale = 2048 / max_dim
-    scaled_w = width * scale
-    scaled_h = height * scale
+    scale = 2048 / max_dim if max_dim > 2048 else 1.0
+    scaled_w, scaled_h = width * scale, height * scale
     min_dim = min(scaled_w, scaled_h)
     if min_dim > 768:
         scale2 = 768 / min_dim
-        scaled_w *= scale2
-        scaled_h *= scale2
+        scaled_w, scaled_h = scaled_w * scale2, scaled_h * scale2
     tiles_w = max(1, math.ceil(scaled_w / 512))
     tiles_h = max(1, math.ceil(scaled_h / 512))
     return 85 + 170 * (tiles_w * tiles_h)
@@ -286,12 +274,11 @@ def _discover_owui_schema() -> Optional[str]:
     try:
         from open_webui.config import DATABASE_SCHEMA
 
-        schema = (
+        return (
             DATABASE_SCHEMA.value
             if hasattr(DATABASE_SCHEMA, "value")
             else DATABASE_SCHEMA
         )
-        return schema if schema else None
     except Exception:
         return None
 
@@ -347,8 +334,7 @@ class RuntimeSegments:
 
     @property
     def final_messages(self) -> List[Dict[str, Any]]:
-        merged = []
-        merged.extend(self.protected_start)
+        merged = list(self.protected_start)
         if self.summary_message:
             merged.append(self.summary_message)
         merged.extend(self.summarized_media)
@@ -417,8 +403,10 @@ class SummaryStore:
             with get_db_context() as db:
                 record = db.query(ChatManifest).filter_by(chat_id=chat_id).first()
                 if record:
-                    record.summary_content = content
-                    record.until_timestamp = until_timestamp
+                    record.summary_content, record.until_timestamp = (
+                        content,
+                        until_timestamp,
+                    )
                     record.updated_at = datetime.now(timezone.utc)
                 else:
                     db.add(
@@ -488,25 +476,22 @@ class TokenCounter:
                 elif isinstance(part, str):
                     total += TokenCounter._count_text(part)
 
-        if isinstance(msg.get("tool_calls"), list):
-            for tc in msg["tool_calls"]:
-                if not isinstance(tc, dict):
-                    continue
-                if isinstance(tc.get("id"), str):
-                    total += TokenCounter._count_text(tc["id"])
-                if isinstance(tc.get("type"), str):
-                    total += TokenCounter._count_text(tc["type"])
-                func = tc.get("function", {})
-                if isinstance(func, dict):
-                    if isinstance(func.get("name"), str):
-                        total += TokenCounter._count_text(func["name"])
-                    if isinstance(func.get("arguments"), str):
-                        total += TokenCounter._count_text(func["arguments"])
+        for tc in (
+            msg.get("tool_calls", []) if isinstance(msg.get("tool_calls"), list) else []
+        ):
+            if not isinstance(tc, dict):
+                continue
+            total += TokenCounter._count_text(
+                tc.get("id", "")
+            ) + TokenCounter._count_text(tc.get("type", ""))
+            if isinstance(func := tc.get("function", {}), dict):
+                total += TokenCounter._count_text(
+                    func.get("name", "")
+                ) + TokenCounter._count_text(func.get("arguments", ""))
 
-        if isinstance(msg.get("tool_call_id"), str):
-            total += TokenCounter._count_text(msg["tool_call_id"])
-        if isinstance(msg.get("name"), str):
-            total += TokenCounter._count_text(msg["name"])
+        total += TokenCounter._count_text(
+            msg.get("tool_call_id", "")
+        ) + TokenCounter._count_text(msg.get("name", ""))
         return total + 4
 
     @staticmethod
@@ -514,19 +499,23 @@ class TokenCounter:
         if isinstance(content, str):
             return content
         if isinstance(content, dict):
-            if str(content.get("type", "")).strip().lower() in {"text", "input_text"}:
-                return str(content.get("text") or content.get("content") or "")
-            return ""
+            return (
+                str(content.get("text") or content.get("content") or "")
+                if str(content.get("type", "")).strip().lower()
+                in {"text", "input_text"}
+                else ""
+            )
         if isinstance(content, list):
-            texts = []
-            for part in content:
-                if isinstance(part, dict) and str(
-                    part.get("type", "")
-                ).strip().lower() in {"text", "input_text"}:
-                    texts.append(str(part.get("text") or part.get("content") or ""))
-                elif isinstance(part, str):
-                    texts.append(part)
-            return " ".join(t for t in texts if t)
+            return " ".join(
+                (
+                    str(p.get("text") or p.get("content") or "")
+                    if isinstance(p, dict)
+                    and str(p.get("type", "")).strip().lower() in {"text", "input_text"}
+                    else str(p)
+                )
+                for p in content
+                if isinstance(p, (dict, str))
+            ).strip()
         return ""
 
 
@@ -549,30 +538,41 @@ class ContextReconstructor:
             if target_indices is not None and i not in target_indices:
                 continue
 
-            if msg.get("role") == "tool":
-                text = TokenCounter.extract_text(msg.get("content"))
-                if text and TokenCounter._count_text(text) > threshold:
-                    msg["content"] = collapsed
-                    stats["trimmed_count"] += 1
+            if (
+                msg.get("role") == "tool"
+                and TokenCounter._count_text(
+                    TokenCounter.extract_text(msg.get("content"))
+                )
+                > threshold
+            ):
+                msg["content"] = collapsed
+                stats["trimmed_count"] += 1
 
-            if isinstance(msg.get("tool_calls"), list):
-                for tc in msg["tool_calls"]:
-                    if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
-                        args = tc["function"].get("arguments")
-                        if (
-                            isinstance(args, str)
-                            and TokenCounter._count_text(args) > threshold
-                        ):
-                            tc["function"]["arguments"] = collapsed
-                            stats["trimmed_count"] += 1
+            for tc in (
+                msg.get("tool_calls", [])
+                if isinstance(msg.get("tool_calls"), list)
+                else []
+            ):
+                if isinstance(tc, dict) and isinstance(
+                    func := tc.get("function"), dict
+                ):
+                    if (
+                        isinstance(args := func.get("arguments"), str)
+                        and TokenCounter._count_text(args) > threshold
+                    ):
+                        func["arguments"] = collapsed
+                        stats["trimmed_count"] += 1
 
-            content = msg.get("content")
-            if isinstance(content, str) and '<details type="tool_calls"' in content:
+            if (
+                isinstance(content := msg.get("content"), str)
+                and '<details type="tool_calls"' in content
+            ):
 
                 def _replace(match):
                     block = match.group(0)
-                    res = TOOL_RESULT_ATTR_RE.search(block)
-                    if res and TokenCounter._count_text(res.group(1)) > threshold:
+                    if (
+                        res := TOOL_RESULT_ATTR_RE.search(block)
+                    ) and TokenCounter._count_text(res.group(1)) > threshold:
                         stats["trimmed_count"] += 1
                         return TOOL_RESULT_ATTR_RE.sub(
                             f'result="{collapsed}"', block, count=1
@@ -624,8 +624,6 @@ class Filter:
         debug_logging: bool = Field(
             default=False, description="Enable detailed console logging."
         )
-
-        # Image Compression Valves
         enable_image_compression: bool = Field(
             default=False, description="Opt-in to native semantic image compression."
         )
@@ -702,6 +700,13 @@ class Filter:
             except Exception:
                 pass
 
+    def _get_chat_id(self, body: dict, metadata: dict) -> Optional[str]:
+        return (
+            (metadata or {}).get("chat_id")
+            or body.get("chat_id")
+            or body.get("meta", {}).get("chat_id")
+        )
+
     def _timestamp_of(self, msg: Dict[str, Any]) -> Optional[int]:
         if not isinstance(msg, dict):
             return None
@@ -739,11 +744,48 @@ class Filter:
         return result
 
     def _scrub_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        scrubbed = {
             k: v
             for k, v in msg.items()
             if k in {"id", "parentId", "role", "content", "timestamp"}
         }
+        if not isinstance(scrubbed.get("content"), str):
+            return scrubbed
+
+        files, images = msg.get("files", []), msg.get("images", [])
+        if not files and not images:
+            return scrubbed
+
+        new_content = (
+            [{"type": "text", "text": scrubbed["content"]}]
+            if scrubbed["content"]
+            else []
+        )
+
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            url = f.get("url") or (
+                f"/api/v1/files/{f.get('id')}/content" if f.get("id") else None
+            )
+            if not url:
+                continue
+
+            if (
+                f.get("type") == "image"
+                or "image/" in f.get("meta", {}).get("content_type", "")
+                or url.startswith("data:image/")
+            ):
+                new_content.append({"type": "image_url", "image_url": {"url": url}})
+
+        for img in images:
+            if isinstance(img, str):
+                new_content.append({"type": "image_url", "image_url": {"url": img}})
+
+        if len(new_content) > (1 if scrubbed["content"] else 0):
+            scrubbed["content"] = new_content
+
+        return scrubbed
 
     def _load_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
         if not chat_id or Chats is None:
@@ -756,13 +798,6 @@ class Filter:
         chat_payload = getattr(chat_record, "chat", {})
         if not isinstance(chat_payload, dict):
             return []
-
-        if isinstance(chat_payload.get("messages"), list):
-            return [
-                self._scrub_message(m)
-                for m in self._unfold_messages(deepcopy(chat_payload["messages"]))
-                if m.get("content")
-            ]
 
         history = chat_payload.get("history", {})
         history_msgs = history.get("messages", {})
@@ -781,6 +816,13 @@ class Filter:
             return [
                 self._scrub_message(m)
                 for m in self._unfold_messages(ordered)
+                if m.get("content")
+            ]
+
+        if isinstance(chat_payload.get("messages"), list):
+            return [
+                self._scrub_message(m)
+                for m in self._unfold_messages(deepcopy(chat_payload["messages"]))
                 if m.get("content")
             ]
         return []
@@ -846,10 +888,7 @@ class Filter:
                 body_idx -= 1
                 continue
             if d_msg.get("role") == b_msg.get("role"):
-                if isinstance(
-                    b_msg.get("content"), list
-                ) or self._message_has_passthrough_media(b_msg):
-                    d_msg["content"] = deepcopy(b_msg.get("content"))
+                d_msg["content"] = deepcopy(b_msg.get("content"))
                 db_idx -= 1
                 body_idx -= 1
             else:
@@ -875,7 +914,6 @@ class Filter:
             else None
         )
 
-    # --- Image Processing Methods ---
     def _process_pool_images(
         self,
         pool: List[Dict[str, Any]],
@@ -885,8 +923,8 @@ class Filter:
     ) -> List[Dict[str, Any]]:
         if not self.valves.enable_image_compression or not pool:
             return pool
-
         processed_pool = []
+
         for msg in pool:
             if not isinstance(msg, dict) or not msg.get("content"):
                 processed_pool.append(msg)
@@ -920,44 +958,41 @@ class Filter:
                 processed_pool.append(msg_copy)
                 continue
 
-            if compressor and PILLOW_AVAILABLE:
-                if isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "image_url":
-                            img_url = part.get("image_url", {})
-                            url = (
-                                img_url.get("url", "")
-                                if isinstance(img_url, dict)
-                                else str(img_url)
-                            )
-                            b64, fmt, _ = extract_base64_data(url)
-                            if (
-                                b64
-                                and calculate_base64_size(b64)
-                                > self.valves.max_image_size_bytes
-                            ):
-                                try:
-                                    new_b64, new_fmt, stats = compressor.compress_image(
-                                        b64, fmt, quality
-                                    )
-                                    if isinstance(part["image_url"], dict):
-                                        part["image_url"][
-                                            "url"
-                                        ] = f"data:{MIME_TYPES.get(new_fmt, 'image/jpeg')};base64,{new_b64}"
-                                    else:
-                                        part["image_url"] = (
-                                            f"data:{MIME_TYPES.get(new_fmt, 'image/jpeg')};base64,{new_b64}"
-                                        )
-                                    self._image_stats["compressed"] += 1
-                                    self._image_stats["saved_bytes"] += (
-                                        stats["original_size"]
-                                        - stats["compressed_size"]
-                                    )
-                                    self._image_stats["original_bytes"] += stats[
-                                        "original_size"
-                                    ]
-                                except Exception as e:
-                                    logger.debug(f"Image compression failed: {e}")
+            if compressor and PILLOW_AVAILABLE and isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        img_url = part.get("image_url", {})
+                        url = (
+                            img_url.get("url", "")
+                            if isinstance(img_url, dict)
+                            else str(img_url)
+                        )
+                        b64, fmt, _ = extract_base64_data(url)
+
+                        if (
+                            b64
+                            and calculate_base64_size(b64)
+                            > self.valves.max_image_size_bytes
+                        ):
+                            try:
+                                new_b64, new_fmt, stats = compressor.compress_image(
+                                    b64, fmt, quality
+                                )
+                                new_url = f"data:{MIME_TYPES.get(new_fmt, 'image/jpeg')};base64,{new_b64}"
+                                if isinstance(part["image_url"], dict):
+                                    part["image_url"]["url"] = new_url
+                                else:
+                                    part["image_url"] = new_url
+
+                                self._image_stats["compressed"] += 1
+                                self._image_stats["saved_bytes"] += (
+                                    stats["original_size"] - stats["compressed_size"]
+                                )
+                                self._image_stats["original_bytes"] += stats[
+                                    "original_size"
+                                ]
+                            except Exception as e:
+                                logger.debug(f"Image compression failed: {e}")
 
             processed_pool.append(msg_copy)
         return processed_pool
@@ -966,8 +1001,7 @@ class Filter:
         if not self.valves.enable_image_compression:
             return
         for msg in messages:
-            content = msg.get("content")
-            if isinstance(content, list):
+            if isinstance(content := msg.get("content"), list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         self._image_stats["count"] += 1
@@ -992,10 +1026,8 @@ class Filter:
                             except Exception:
                                 pass
                         else:
-                            # Fallback estimate for unhydrated images (like in the outlet)
                             self._image_stats["tokens"] += 85
 
-    # --- View Building ---
     def _build_runtime_view(
         self,
         aligned_messages: List[Dict[str, Any]],
@@ -1021,17 +1053,17 @@ class Filter:
         )
 
         summarized_media = [
-            self._build_media_only_message(m)
-            for m in pools.summarized
-            if self._message_has_passthrough_media(m)
+            m
+            for p in pools.summarized
+            if (m := self._build_media_only_message(p))
+            and self._message_has_passthrough_media(p)
         ]
-        summarized_media = [m for m in summarized_media if m]
 
-        trim_targets = set(range(len(pools.compressible)))
         trimmed_compressible, _ = self.reconstructor.trim_tool_content(
-            pools.compressible, self.valves.tool_trim_threshold, trim_targets
+            pools.compressible,
+            self.valves.tool_trim_threshold,
+            set(range(len(pools.compressible))),
         )
-
         protected_start = (
             self.reconstructor.trim_tool_content(
                 pools.protected_start, self.valves.tool_trim_threshold
@@ -1047,7 +1079,6 @@ class Filter:
             else pools.protected_end
         )
 
-        # Apply Image Compression Semantic Gradient
         if self.valves.enable_image_compression:
             compressor = (
                 ImageCompressor(
@@ -1109,7 +1140,6 @@ class Filter:
             else None
         )
 
-        # Enforce limits
         max_tok = self.valves.max_context_tokens
         total_tok = sum(
             TokenCounter.count(m)
@@ -1148,29 +1178,26 @@ class Filter:
         u_tok = sum(TokenCounter.count(m) for m in uncompressed)
         s_tok = TokenCounter.count(summary_message) if summary_message else 0
         sm_tok = sum(TokenCounter.count(m) for m in summarized_media)
-
         raw_s_tok = sum(TokenCounter.count(m) for m in pools.summarized)
+
         eff_str = (
             f" @ {round((raw_s_tok - s_tok)/raw_s_tok * 100, 2)}%"
             if raw_s_tok > 0
             else ""
         )
-
         stats = f"🪙 {format_tokens(p_tok + u_tok + s_tok + sm_tok)} │ 🛡️ {format_tokens(p_tok)} ({len(protected_start)+len(protected_end)}) · ⏳ {format_tokens(u_tok)} ({len(uncompressed)}) · 📦 {format_tokens(s_tok)} ({len(pools.summarized)}{eff_str})"
         if was_shed:
             stats = f"⚠️ Limit Reached │ {stats}"
 
         if self.valves.enable_image_compression and self._image_stats["count"] > 0:
-            img_tok = self._image_stats["tokens"]
-            img_cnt = self._image_stats["count"]
-            orig_b = self._image_stats["original_bytes"]
-            saved_b = self._image_stats["saved_bytes"]
-
-            if orig_b > 0:
-                img_eff = round((saved_b / orig_b) * 100)
-                stats += f" │ 🖼️ {format_tokens(img_tok)} ({img_cnt} @ {img_eff}%)"
-            else:
-                stats += f" │ 🖼️ {format_tokens(img_tok)} ({img_cnt})"
+            img_tok, img_cnt, orig_b, saved_b = (
+                self._image_stats["tokens"],
+                self._image_stats["count"],
+                self._image_stats["original_bytes"],
+                self._image_stats["saved_bytes"],
+            )
+            img_eff = f" @ {round((saved_b / orig_b) * 100)}%" if orig_b > 0 else ""
+            stats += f" │ 🖼️ {format_tokens(img_tok)} ({img_cnt}{img_eff})"
 
         return RuntimeView(
             segments.final_messages,
@@ -1193,12 +1220,7 @@ class Filter:
         __request__: Request = None,
         __model__: dict = None,
     ) -> dict:
-        chat_id = (
-            (metadata.get("chat_id") if (metadata := __metadata__ or {}) else None)
-            or body.get("chat_id")
-            or body.get("meta", {}).get("chat_id")
-        )
-        if not chat_id:
+        if not (chat_id := self._get_chat_id(body, __metadata__)):
             return body
 
         state = self._get_summary_state(chat_id)
@@ -1220,12 +1242,7 @@ class Filter:
         __request__: Request = None,
         __model__: dict = None,
     ) -> dict:
-        chat_id = (
-            (metadata.get("chat_id") if (metadata := __metadata__ or {}) else None)
-            or body.get("chat_id")
-            or body.get("meta", {}).get("chat_id")
-        )
-        if not chat_id:
+        if not (chat_id := self._get_chat_id(body, __metadata__)):
             return body
 
         state = self._get_summary_state(chat_id)
@@ -1236,16 +1253,15 @@ class Filter:
 
         view = self._build_runtime_view(aligned, state, __model__)
 
-        # Strip media for summarizer
         text_msgs = []
         for m in aligned:
             text_msg = {
                 "role": m.get("role", "user"),
                 "content": TokenCounter.extract_text(m.get("content", "")),
             }
-            for k in ("timestamp", "created_at", "id"):
-                if k in m:
-                    text_msg[k] = m[k]
+            text_msg.update(
+                {k: m[k] for k in ("timestamp", "created_at", "id") if k in m}
+            )
             if text_msg["content"]:
                 text_msgs.append(text_msg)
 
@@ -1335,8 +1351,11 @@ Active facts, preferences, project constraints, and state. Include confidence %:
 What was chosen and why (e.g., architecture, purchases, methodologies). Replace superseded decisions.
 ## Resolutions
 Resolved problems, fixed errors, or completed tasks. Remove obsolete ones.
-## Key Artifacts / Code
-Verbatim final code, commands, text blocks, or finalized lists (e.g., parts lists, itineraries). Replace older versions. If none, omit section.
+## Working States & Code
+Preserve VERBATIM code blocks, configurations, terminal commands, and finalized lists. 
+- Code: DO NOT summarize working code. Keep the exact syntax and language fences. Replace older versions with the latest working state.
+- General: Track the latest working state of architectures, itineraries, or configurations.
+If none, omit section.
 ## Open Items
 Pending actions, blockers, or unanswered questions. Remove when resolved.
 ### RULES
