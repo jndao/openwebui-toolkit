@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.1.0
+version: 0.1.1-dev.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -1375,29 +1375,29 @@ You are the "Context Architect". Update the conversation archive using the new e
 
 ### STRUCTURE (Keep exact order. Include all headers even if empty)
 ## Current State
-Active facts, preferences, and state. Include confidence %:
-- 90-100%: Verified/Implemented
-- 70-89%: Strongly implied
+Active facts, preferences, project constraints, and state. Include confidence %:
+- 90-100%: Verified/Implemented/Purchased
+- 70-89%: Strongly implied/Planned
 - 50-69%: Tentative/Discussed
 - <50%: Omit entirely
 
 ## Decisions
-What was chosen and why. Replace superseded decisions.
+What was chosen and why (e.g., architecture, purchases, methodologies). Replace superseded decisions.
 
 ## Resolutions
-Resolved problems/errors. Remove obsolete ones.
+Resolved problems, fixed errors, or completed tasks. Remove obsolete ones.
 
-## Final Code/Config
-Verbatim final code, commands, or text. Replace older versions. If none, omit section.
+## Key Artifacts / Code
+Verbatim final code, commands, text blocks, or finalized lists (e.g., parts lists, itineraries). Replace older versions. If none, omit section.
 
 ## Open Items
-Pending actions/questions. Remove when resolved.
+Pending actions, blockers, or unanswered questions. Remove when resolved.
 
 ### RULES
 1. PRECEDENCE: New events overwrite the old archive.
 2. NO HALLUCINATION: Only use provided text.
 3. CONCISE: Bullet points only. Strip filler.
-4. TERMINOLOGY: Preserve user's exact terms.
+4. TERMINOLOGY: Preserve user's exact terms (e.g., specific brand names, technical jargon).
 5. OMIT: Small talk, greetings, AI meta-talk.
 6. FORMAT: Do not wrap the entire response in markdown fences. Start directly with "## Current State".
 
