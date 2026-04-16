@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
-version: 0.2.0-dev.12
+version: 0.2.0-dev.21
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -16,7 +16,9 @@ import logging
 import re
 import base64
 import io
+import os
 import math
+import mimetypes
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,6 +31,17 @@ from open_webui.models.users import Users
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.models.chats import Chats
 from open_webui.internal.db import get_db_context
+
+from functools import lru_cache
+from datetime import datetime, timezone
+import os
+import mimetypes
+import base64
+
+try:
+    from open_webui.models.files import Files
+except ImportError:
+    Files = None
 
 try:
     import tiktoken
@@ -120,6 +133,44 @@ def calculate_base64_size(base64_data: str) -> int:
     clean_data = base64_data.replace("\n", "").replace("\r", "").strip()
     return (len(clean_data) * 3) // 4 - clean_data.count("=")
 
+
+@lru_cache(maxsize=256)
+def get_file_base64(file_id: str) -> Optional[str]:
+    """
+    Fetches file from DB, reads from disk, and caches the base64 string.
+    Files are assumed to be immutable after upload to OWUI thus making caching
+    deterministic.
+    """
+    if not file_id or Files is None:
+        return None
+    try:
+        file_record = Files.get_file_by_id(file_id)
+        if not file_record or not file_record.path:
+            return None
+        if not os.path.exists(file_record.path):
+            return None
+
+        # 1. Get the real mime type from the DB metadata, fallback to filename extension
+        mime_type = None
+        if file_record.meta and isinstance(file_record.meta, dict):
+            mime_type = file_record.meta.get("content_type")
+
+        if not mime_type and file_record.filename:
+            mime_type, _ = mimetypes.guess_type(file_record.filename)
+
+        # 2. If it's STILL unknown, or explicitly NOT an image, abort.
+        if not mime_type or not mime_type.startswith("image/"):
+            return None
+
+        with open(file_record.path, "rb") as f:
+            file_bytes = f.read()
+
+        b64_data = base64.b64encode(file_bytes).decode("utf-8")
+        return f"data:{mime_type};base64,{b64_data}"
+    except Exception as e:
+        logger.debug(f"Failed to load file {file_id} from disk: {e}")
+        return None
+        
 
 def format_tokens(token_count: int) -> str:
     if token_count >= 1_000_000:
@@ -765,9 +816,18 @@ class Filter:
         for f in files:
             if not isinstance(f, dict):
                 continue
-            url = f.get("url") or (
-                f"/api/v1/files/{f.get('id')}/content" if f.get("id") else None
-            )
+
+            file_id = f.get("id")
+            url = f.get("url")
+
+            # Fetch base64 directly from disk if possible!
+            b64_url = get_file_base64(file_id) if file_id else None
+
+            if b64_url:
+                url = b64_url
+            elif not url and file_id:
+                url = f"/api/v1/files/{file_id}/content"
+
             if not url:
                 continue
 
@@ -780,6 +840,11 @@ class Filter:
 
         for img in images:
             if isinstance(img, str):
+                # If it's a file ID, fetch from disk
+                if not img.startswith("data:") and not img.startswith("http"):
+                    b64_url = get_file_base64(img)
+                    if b64_url:
+                        img = b64_url
                 new_content.append({"type": "image_url", "image_url": {"url": img}})
 
         if len(new_content) > (1 if scrubbed["content"] else 0):
@@ -879,20 +944,49 @@ class Filter:
     def _align_messages(
         self, db_msgs: List[Dict[str, Any]], body_msgs: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        aligned = deepcopy(db_msgs)
-        db_idx, body_idx = len(aligned) - 1, len(body_msgs) - 1
+        aligned = []
 
-        while db_idx >= 0 and body_idx >= 0:
-            d_msg, b_msg = aligned[db_idx], body_msgs[body_idx]
-            if b_msg.get("role") == "system" and d_msg.get("role") != "system":
-                body_idx -= 1
-                continue
-            if d_msg.get("role") == b_msg.get("role"):
-                d_msg["content"] = deepcopy(b_msg.get("content"))
-                db_idx -= 1
-                body_idx -= 1
-            else:
-                db_idx -= 1
+        # 1. System prompts from frontend
+        for b in body_msgs:
+            if b.get("role") == "system":
+                aligned.append(deepcopy(b))
+
+        # 2. DB messages (now with base64 injected from disk!)
+        for d in db_msgs:
+            aligned.append(deepcopy(d))
+
+        if not body_msgs:
+            return aligned
+
+        # 3. Append the final user/assistant message if it's new
+        last_b = body_msgs[-1]
+        if last_b.get("role") != "system":
+            b_text = TokenCounter.extract_text(last_b.get("content", "")).strip()
+
+            is_new = True
+            if aligned:
+                last_aligned = aligned[-1]
+                if last_aligned.get("role") == last_b.get("role"):
+                    a_text = TokenCounter.extract_text(
+                        last_aligned.get("content", "")
+                    ).strip()
+                    if b_text == a_text:
+                        is_new = False
+                        # If it's not new, optionally upgrade content if frontend has richer media
+                        frontend_content = last_b.get("content")
+                        if isinstance(frontend_content, list):
+                            has_image = any(
+                                isinstance(p, dict)
+                                and str(p.get("type", "")).strip().lower()
+                                in {"image_url", "image"}
+                                for p in frontend_content
+                            )
+                            if has_image:
+                                aligned[-1]["content"] = deepcopy(frontend_content)
+
+            if is_new:
+                aligned.append(deepcopy(last_b))
+
         return aligned
 
     def _build_media_only_message(
@@ -1247,8 +1341,6 @@ class Filter:
 
         state = self._get_summary_state(chat_id)
         db_msgs = self._load_chat_messages(chat_id)
-        if body.get("messages"):
-            db_msgs.append(body["messages"][-1])
         aligned = self._align_messages(db_msgs, body.get("messages", []))
 
         view = self._build_runtime_view(aligned, state, __model__)
