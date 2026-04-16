@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.1.1-dev.2
+version: 0.1.1-dev.3
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -631,7 +631,6 @@ class Filter:
     KEEP_FIELDS = frozenset({"id", "parentId", "role", "content", "timestamp"})
 
     def _scrub_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove unnecessary fields from a message, keeping only essential fields."""
         if not isinstance(msg, dict):
             return {}
         return {k: v for k, v in msg.items() if k in self.KEEP_FIELDS}
@@ -770,34 +769,59 @@ class Filter:
                     return True
         return False
 
-    def _get_rich_media_map(
-        self, body_messages: List[Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
-        """Maps message identity to the full multimodal message from the frontend."""
-        rich_map = {}
-        if not isinstance(body_messages, list):
-            return rich_map
-        for msg in body_messages:
-            if self._message_has_passthrough_media(msg):
-                ident = self._message_identity(msg)
-                if ident:
-                    rich_map[ident] = deepcopy(msg)
-        return rich_map
-
-    def _rehydrate_pool(
-        self, pool: List[Dict[str, Any]], rich_map: Dict[str, Dict[str, Any]]
+    def _align_messages(
+        self, db_msgs: List[Dict[str, Any]], body_msgs: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Restores media to messages in their original chronological position."""
-        rehydrated = []
-        for msg in pool:
-            ident = self._message_identity(msg)
-            if ident and ident in rich_map:
-                rehydrated.append(rich_map[ident])
+        """
+        body_msgs contains the fully hydrated base64 images from OpenWebUI.
+        db_msgs contains the timestamps.
+        We align them from newest to oldest to inject timestamps into the rich body messages.
+        """
+        aligned = deepcopy(body_msgs)
+        db_idx = len(db_msgs) - 1
+        body_idx = len(aligned) - 1
+
+        while body_idx >= 0 and db_idx >= 0:
+            b_msg = aligned[body_idx]
+            d_msg = db_msgs[db_idx]
+
+            if b_msg.get("role") == d_msg.get("role"):
+                ts = self._timestamp_of(d_msg)
+                if ts is not None:
+                    b_msg["timestamp"] = ts
+                db_idx -= 1
+                body_idx -= 1
             else:
-                # Ensure non-media messages are strictly text to save tokens
-                text_msg = self._build_text_only_message(msg)
-                rehydrated.append(text_msg if text_msg else msg)
-        return rehydrated
+                # Mismatch (e.g., system prompt injected by frontend). Skip body message.
+                body_idx -= 1
+
+        return aligned
+
+    def _build_media_only_message(
+        self, msg: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Strips text from a message, returning ONLY the photos/files."""
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return None
+
+        media_parts = []
+        for part in content:
+            if isinstance(part, dict):
+                part_type = str(part.get("type", "")).strip().lower()
+                if part_type in {
+                    "image_url",
+                    "image",
+                    "file",
+                    "input_image",
+                    "input_file",
+                }:
+                    media_parts.append(part)
+
+        if not media_parts:
+            return None
+
+        return {"role": msg.get("role", "user"), "content": media_parts}
 
     def _build_text_only_message(
         self, message: Dict[str, Any]
@@ -900,40 +924,30 @@ class Filter:
 
     def _build_runtime_view(
         self,
-        db_messages: List[Dict[str, Any]],
-        body_messages: List[Dict[str, Any]],
+        aligned_messages: List[Dict[str, Any]],
         summary_state: SummaryState,
     ) -> RuntimeView:
 
-        # 1. Map rich media from the frontend
-        rich_media_map = self._get_rich_media_map(body_messages)
-
-        message_count = len(db_messages)
+        message_count = len(aligned_messages)
         keep_start = min(self.valves.keep_start_messages, message_count)
         keep_end = min(
             self.valves.keep_last_messages, max(0, message_count - keep_start)
         )
 
         pools = self._split_message_pools(
-            db_messages,
+            aligned_messages,
             summary_state.until_ts,
             keep_start,
             keep_end,
         )
 
-        # 2. Rehydrate pools in-place (Goals 1 & 2)
-        pools.protected_start = self._rehydrate_pool(
-            pools.protected_start, rich_media_map
-        )
-        pools.compressible = self._rehydrate_pool(pools.compressible, rich_media_map)
-        pools.protected_end = self._rehydrate_pool(pools.protected_end, rich_media_map)
-
-        # 3. Extract media from summarized messages (Goal 3)
+        # Extract ONLY the media from summarized messages
         summarized_media = []
         for msg in pools.summarized:
-            ident = self._message_identity(msg)
-            if ident and ident in rich_media_map:
-                summarized_media.append(rich_media_map[ident])
+            if self._message_has_passthrough_media(msg):
+                media_msg = self._build_media_only_message(msg)
+                if media_msg:
+                    summarized_media.append(media_msg)
 
         # Apply tool trimming to the compressible (uncompressed) messages
         trim_targets = set(range(len(pools.compressible)))
@@ -943,12 +957,10 @@ class Filter:
             target_indices=trim_targets,
         )
 
-        # Package the segments (optionally trim protected messages)
+        # Package the segments (Media is natively preserved here)
         if self.valves.trim_protected_messages and pools.protected_start:
             trimmed_protected_start, _ = self.reconstructor.trim_tool_content(
-                pools.protected_start,
-                self.valves.tool_trim_threshold,
-                target_indices=set(range(len(pools.protected_start))),
+                pools.protected_start, self.valves.tool_trim_threshold
             )
             protected_start = self._package_messages(trimmed_protected_start)
         else:
@@ -956,9 +968,7 @@ class Filter:
 
         if self.valves.trim_protected_messages and pools.protected_end:
             trimmed_protected_end, _ = self.reconstructor.trim_tool_content(
-                pools.protected_end,
-                self.valves.tool_trim_threshold,
-                target_indices=set(range(len(pools.protected_end))),
+                pools.protected_end, self.valves.tool_trim_threshold
             )
             protected_end = self._package_messages(trimmed_protected_end)
         else:
@@ -980,7 +990,6 @@ class Filter:
             )
         )
 
-        # Build segments
         segments = RuntimeSegments(
             protected_start=protected_start,
             summary_message=summary_message,
@@ -989,7 +998,6 @@ class Filter:
             protected_end=protected_end,
         )
 
-        # Build stats from explicit segments
         protected_all = protected_start + protected_end
         (
             stats_message,
@@ -1045,15 +1053,14 @@ class Filter:
 
     def _get_compressible_text_messages(
         self,
-        db_messages: List[Dict[str, Any]],
+        aligned_messages: List[Dict[str, Any]],
         summary_state: SummaryState,
     ) -> List[Dict[str, Any]]:
-        text_only_db_messages = self._build_text_only_messages(db_messages)
-        text_only_db_messages = self._package_messages(
-            self._prepare_db_messages(text_only_db_messages)
-        )
+        text_only_aligned_messages = self._build_text_only_messages(aligned_messages)
+        text_only_aligned_messages = self._package_messages(text_only_aligned_messages)
+
         pools = self._split_message_pools(
-            text_only_db_messages,
+            text_only_aligned_messages,
             summary_state.until_ts,
             self.valves.keep_start_messages,
             self.valves.keep_last_messages,
@@ -1155,9 +1162,11 @@ class Filter:
         summary_state = self._get_summary_state(chat_id)
         db_messages = self._load_chat_messages(chat_id)
 
+        # Align the fully hydrated body messages with DB timestamps
+        aligned_messages = self._align_messages(db_messages, body.get("messages", []))
+
         view = self._build_runtime_view(
-            db_messages,
-            body.get("messages", []),
+            aligned_messages,
             summary_state,
         )
 
@@ -1188,16 +1197,20 @@ class Filter:
         db_messages = self._load_chat_messages(chat_id)
 
         # inject assistant message as it has yet to be written to DB
-        db_messages.append(body["messages"][-1])
+        if body.get("messages"):
+            db_messages.append(body["messages"][-1])
+
+        # Align the fully hydrated body messages with DB timestamps
+        aligned_messages = self._align_messages(db_messages, body.get("messages", []))
 
         view = self._build_runtime_view(
-            db_messages,
-            body.get("messages", []),
+            aligned_messages,
             summary_state,
         )
 
+        # The summarizer ONLY gets text, so we strip media here before counting/compressing
         compressible_text_messages = self._get_compressible_text_messages(
-            db_messages, summary_state
+            aligned_messages, summary_state
         )
 
         db_uncompressed_tokens = self._count_tokens_in_messages(
@@ -1233,8 +1246,7 @@ class Filter:
                 )
                 summary_state = self._get_summary_state(chat_id)
                 view = self._build_runtime_view(
-                    db_messages,
-                    body.get("messages", []),
+                    aligned_messages,
                     summary_state,
                 )
                 self._debug_runtime_view(chat_id, "outlet-after", view, summary_state)
