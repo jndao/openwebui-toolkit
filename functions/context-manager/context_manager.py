@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
-version: 0.2.0-dev.21
+version: 0.2.0-dev.22
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -557,16 +557,14 @@ class TokenCounter:
                 else ""
             )
         if isinstance(content, list):
-            return " ".join(
-                (
-                    str(p.get("text") or p.get("content") or "")
-                    if isinstance(p, dict)
-                    and str(p.get("type", "")).strip().lower() in {"text", "input_text"}
-                    else str(p)
-                )
-                for p in content
-                if isinstance(p, (dict, str))
-            ).strip()
+            parts = []
+            for p in content:
+                if isinstance(p, str):
+                    parts.append(p)
+                elif isinstance(p, dict):
+                    if str(p.get("type", "")).strip().lower() in {"text", "input_text"}:
+                        parts.append(str(p.get("text") or p.get("content") or ""))
+            return " ".join(parts).strip()
         return ""
 
 
