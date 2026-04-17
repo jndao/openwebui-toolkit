@@ -3,7 +3,7 @@ title: Context Manager
 id: context_manager
 author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
-version: 0.2.0-dev.22
+version: 0.2.0-dev.24
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -135,6 +135,24 @@ def calculate_base64_size(base64_data: str) -> int:
 
 
 @lru_cache(maxsize=256)
+def get_cached_ocr_description(file_id: str) -> str:
+    """
+    Performs OCR and caches the result based on the immutable File ID.
+    This avoids hashing massive base64 strings.
+    """
+    b64_uri = get_file_base64(file_id)
+    if not b64_uri:
+        return "[Image content not available]"
+    
+    # Extract the raw b64 part from the data URI
+    _, _, raw_url = extract_base64_data(b64_uri)
+    b64_data, _, _ = extract_base64_data(raw_url)
+    
+    if text := extract_text_from_image(b64_data):
+        return f"[OCR Text]: {text}"
+    return "[Image content available but no text detected]"
+
+@lru_cache(maxsize=256)
 def get_file_base64(file_id: str) -> Optional[str]:
     """
     Fetches file from DB, reads from disk, and caches the base64 string.
@@ -195,17 +213,19 @@ def extract_text_from_image(base64_data: str) -> Optional[str]:
     if not RAPIDOCR_AVAILABLE or _ocr_engine is None:
         return None
     try:
+        # Extract data from URI if present
+        if "base64," in base64_data:
+            base64_data = base64_data.split("base64,")[1]
+            
         result, _ = _ocr_engine(base64.b64decode(base64_data))
         if not result:
             return None
-        text = " ".join(
-            [line[1] for line in result if len(line) >= 2 and line[1]]
-        ).strip()
-        return text if text else None
+        return " ".join([line[1] for line in result if len(line) >= 2 and line[1]]).strip()
     except Exception:
         return None
 
 
+@lru_cache(maxsize=256)
 def generate_smart_image_description(base64_data: str, use_ocr: bool = True) -> str:
     if use_ocr and RAPIDOCR_AVAILABLE:
         if ocr_text := extract_text_from_image(base64_data):
@@ -1031,18 +1051,17 @@ class Filter:
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "image_url":
                             text = "[Image dropped - model doesn't support vision]"
+                            # Inside _process_pool_images...
                             if self.valves.enable_smart_drop:
-                                img_url = part.get("image_url", {})
-                                url = (
-                                    img_url.get("url", "")
-                                    if isinstance(img_url, dict)
-                                    else str(img_url)
-                                )
-                                b64, _, _ = extract_base64_data(url)
-                                if b64:
-                                    text = generate_smart_image_description(
-                                        b64, self.valves.use_ocr
-                                    )
+                                # Use the file_id directly for the cache key!
+                                if file_id := part.get("id"): 
+                                    text = get_cached_ocr_description(file_id)
+                                else:
+                                    # Fallback for images without IDs (pasted blobs)
+                                    img_url = part.get("image_url", {})
+                                    url = img_url.get("url", "") if isinstance(img_url, dict) else str(img_url)
+                                    b64, _, _ = extract_base64_data(url)
+                                    text = generate_smart_image_description(b64, self.valves.use_ocr)
                             new_content.append({"type": "text", "text": text})
                         else:
                             new_content.append(part)
