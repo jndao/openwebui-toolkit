@@ -2,8 +2,8 @@
 title: Context Manager
 id: context_manager
 author: jndao
-description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency.
-version: 0.1.0
+description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
+version: 0.3.0
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -14,65 +14,366 @@ import asyncio
 import json
 import logging
 import re
+import base64
+import io
+import os
+import math
+import mimetypes
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Callable, Set, Tuple
-
 from fastapi.requests import Request
 from pydantic import BaseModel, Field
-
 from open_webui.models.users import Users
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.models.chats import Chats
-from open_webui.internal.db import get_db_context
+from open_webui.internal.db import get_async_db_context
+from sqlalchemy import select
 
+try:
+    from open_webui.models.files import Files
+except ImportError:
+    Files = None
 try:
     import tiktoken
 
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except ImportError:
     ENCODING = None
-
 try:
     from open_webui.internal.db import Base as owui_Base
-except ImportError:
-    owui_Base = None
-
-try:
     from sqlalchemy import Column, Integer, String, Text, DateTime
 except ImportError:
-    Column = None
-    Integer = None
-    String = None
-    Text = None
-    DateTime = None
+    owui_Base = None
+    Column = Integer = String = Text = DateTime = None
+try:
+    from PIL import Image
+
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+try:
+    from rapidocr_onnxruntime import RapidOCR
+
+    RAPIDOCR_AVAILABLE = True
+except ImportError:
+    RAPIDOCR_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
+# Lazy load OCR engine to prevent cold-start CPU spikes
+_ocr_engine = None
+
+
+def get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None and RAPIDOCR_AVAILABLE:
+        logger.info("Initializing RapidOCR engine for the first time...")
+        _ocr_engine = RapidOCR()
+    return _ocr_engine
+
+
 SUMMARY_TAG = "context_summary"
 SUMMARY_SOURCE = "context_manager"
-
 TOOL_DETAILS_BLOCK_RE = re.compile(r'<details type="tool_calls"[\s\S]*?</details>')
 TOOL_RESULT_ATTR_RE = re.compile(r'result="([^"]*)"')
 
+# =============================================================================
+# IMAGE COMPRESSION CONSTANTS & HELPERS
+# =============================================================================
+IMAGE_PREFIXES = {
+    b"/9j/": "jpeg",
+    b"iVBORw0KGgo": "png",
+    b"R0lGOD": "gif",
+    b"UklGR": "webp",
+    b"Qk0": "bmp",
+}
+MIME_TYPES = {
+    "jpeg": "image/jpeg",
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+}
 
+
+def detect_image_format(base64_data: str) -> Optional[str]:
+    if "base64," in base64_data:
+        base64_data = base64_data.split("base64,")[1]
+    try:
+        sample = base64.b64decode(base64_data[:32])
+        for prefix, fmt in IMAGE_PREFIXES.items():
+            if sample.startswith(prefix):
+                return fmt
+    except Exception:
+        pass
+    return None
+
+
+def extract_base64_data(image_url: str) -> Tuple[Optional[str], Optional[str], str]:
+    if not image_url:
+        return None, None, image_url
+    if image_url.startswith("data:image/"):
+        match = re.match(r"data:image/([^;]+);base64,(.+)", image_url)
+        if match:
+            return (
+                match.group(2),
+                match.group(1).lower().replace("jpg", "jpeg"),
+                image_url,
+            )
+    if re.match(r"^[A-Za-z0-9+/=]+$", image_url.strip()):
+        return image_url.strip(), detect_image_format(image_url), image_url
+    return None, None, image_url
+
+
+def calculate_base64_size(base64_data: str) -> int:
+    clean_data = base64_data.replace("\n", "").replace("\r", "").strip()
+    return (len(clean_data) * 3) // 4 - clean_data.count("=")
+
+
+# Simple async cache for files and OCR
+_file_b64_cache = {}
+_ocr_desc_cache = {}
+
+
+async def get_cached_ocr_description(file_id: str) -> str:
+    """
+    Performs OCR and caches the result based on the immutable File ID.
+    This avoids hashing massive base64 strings.
+    """
+    if file_id in _ocr_desc_cache:
+        return _ocr_desc_cache[file_id]
+
+    b64_uri = await get_file_base64(file_id)
+    if not b64_uri:
+        res = "[Image content not available]"
+        _ocr_desc_cache[file_id] = res
+        return res
+
+    # Extract the raw b64 part from the data URI
+    _, _, raw_url = extract_base64_data(b64_uri)
+    b64_data, _, _ = extract_base64_data(raw_url)
+
+    if text := extract_text_from_image(b64_data):
+        res = f"[OCR Text]: {text}"
+    else:
+        res = "[Image content available but no text detected]"
+
+    _ocr_desc_cache[file_id] = res
+    return res
+
+
+async def get_file_base64(file_id: str) -> Optional[str]:
+    """
+    Fetches file from DB, reads from disk, and caches the base64 string.
+    Files are assumed to be immutable after upload to OWUI thus making caching
+    deterministic.
+    """
+    if not file_id or Files is None:
+        return None
+    if file_id in _file_b64_cache:
+        return _file_b64_cache[file_id]
+
+    try:
+        file_record = await Files.get_file_by_id(file_id)
+        if not file_record or not file_record.path:
+            return None
+        if not os.path.exists(file_record.path):
+            return None
+        # 1. Get the real mime type from the DB metadata, fallback to filename extension
+        mime_type = None
+        if file_record.meta and isinstance(file_record.meta, dict):
+            mime_type = file_record.meta.get("content_type")
+        if not mime_type and file_record.filename:
+            mime_type, _ = mimetypes.guess_type(file_record.filename)
+        # 2. If it's STILL unknown, or explicitly NOT an image, abort.
+        if not mime_type or not mime_type.startswith("image/"):
+            return None
+
+        # Read file in a thread to avoid blocking the event loop
+        def read_file():
+            with open(file_record.path, "rb") as f:
+                return f.read()
+
+        file_bytes = await asyncio.to_thread(read_file)
+        b64_data = base64.b64encode(file_bytes).decode("utf-8")
+        res = f"data:{mime_type};base64,{b64_data}"
+        _file_b64_cache[file_id] = res
+        return res
+    except Exception as e:
+        logger.debug(f"Failed to load file {file_id} from disk: {e}")
+        return None
+
+
+def format_tokens(token_count: int) -> str:
+    if token_count >= 1_000_000:
+        return f"{token_count/1_000_000:.1f}M"
+    if token_count >= 1000:
+        return f"{token_count/1000:.1f}k"
+    return str(int(token_count))
+
+
+def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
+    if not model:
+        return True
+    return bool(
+        model.get("info", {})
+        .get("meta", {})
+        .get("capabilities", {})
+        .get("vision", True)
+    )
+
+
+def extract_text_from_image(base64_data: str) -> Optional[str]:
+    if not RAPIDOCR_AVAILABLE:
+        return None
+    engine = get_ocr_engine()
+    if engine is None:
+        return None
+    try:
+        # Extract data from URI if present
+        if "base64," in base64_data:
+            base64_data = base64_data.split("base64,")[1]
+
+        result, _ = engine(base64.b64decode(base64_data))
+        if not result:
+            return None
+        return " ".join(
+            [line[1] for line in result if len(line) >= 2 and line[1]]
+        ).strip()
+    except Exception:
+        return None
+
+
+def generate_smart_image_description(base64_data: str, use_ocr: bool = True) -> str:
+    if use_ocr and RAPIDOCR_AVAILABLE:
+        if ocr_text := extract_text_from_image(base64_data):
+            return f"[OCR Text]: {ocr_text}"
+    return "[Image content not available - could not extract description]"
+
+
+def estimate_image_tokens_from_dimensions(
+    width: int, height: int, detail: str = "auto"
+) -> int:
+    if width <= 0 or height <= 0:
+        return 0
+    if detail == "low":
+        return 85
+    max_dim = max(width, height)
+    scale = 2048 / max_dim if max_dim > 2048 else 1.0
+    scaled_w, scaled_h = width * scale, height * scale
+    min_dim = min(scaled_w, scaled_h)
+    if min_dim > 768:
+        scale2 = 768 / min_dim
+        scaled_w, scaled_h = scaled_w * scale2, scaled_h * scale2
+    tiles_w = max(1, math.ceil(scaled_w / 512))
+    tiles_h = max(1, math.ceil(scaled_h / 512))
+    return 85 + 170 * (tiles_w * tiles_h)
+
+
+class ImageCompressor:
+    def __init__(
+        self,
+        max_size_bytes: int,
+        convert_png_to_jpeg: bool,
+        preserve_transparency: bool,
+    ):
+        self.max_size_bytes = max_size_bytes
+        self.convert_png_to_jpeg = convert_png_to_jpeg
+        self.preserve_transparency = preserve_transparency
+
+    def compress_image(
+        self, base64_data: str, original_format: Optional[str], quality: int
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        if not PILLOW_AVAILABLE:
+            raise RuntimeError("Pillow is not installed.")
+        image_bytes = base64.b64decode(base64_data)
+        original_size = len(image_bytes)
+        image = Image.open(io.BytesIO(image_bytes))
+        original_format = original_format or (
+            image.format.lower() if image.format else "png"
+        )
+        has_transparency = image.mode in ("RGBA", "LA", "P")
+        target_format = self._determine_target_format(original_format, has_transparency)
+        processed_image = self._prepare_image_for_save(image, target_format)
+        compressed_data = self._compress_at_quality(
+            processed_image, target_format, quality
+        )
+        stats = {
+            "original_size": original_size,
+            "compressed_size": len(compressed_data),
+            "original_format": original_format,
+            "new_format": target_format,
+            "quality": quality,
+        }
+        return base64.b64encode(compressed_data).decode("utf-8"), target_format, stats
+
+    def _determine_target_format(
+        self, original_format: str, has_transparency: bool
+    ) -> str:
+        if original_format in ("jpeg", "jpg", "webp", "gif"):
+            return original_format
+        if self.convert_png_to_jpeg:
+            return (
+                "webp" if (has_transparency and self.preserve_transparency) else "jpeg"
+            )
+        return original_format
+
+    def _prepare_image_for_save(
+        self, image: Image.Image, target_format: str
+    ) -> Image.Image:
+        if target_format == "jpeg":
+            if image.mode in ("RGBA", "LA", "P"):
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                if image.mode == "P":
+                    image = image.convert("RGBA")
+                if image.mode in ("RGBA", "LA"):
+                    background.paste(image, mask=image.split()[-1])
+                    return background
+            return image.convert("RGB") if image.mode != "RGB" else image
+        elif target_format == "webp":
+            if image.mode == "P":
+                return image.convert(
+                    "RGBA" if image.info.get("transparency") else "RGB"
+                )
+            if image.mode not in ("RGB", "RGBA", "L"):
+                return image.convert("RGB")
+        return image
+
+    def _compress_at_quality(
+        self, image: Image.Image, target_format: str, quality: int
+    ) -> bytes:
+        buffer = io.BytesIO()
+        kwargs = (
+            {"quality": quality, "optimize": True}
+            if target_format in ("jpeg", "webp")
+            else {"optimize": True}
+        )
+        if target_format == "webp":
+            kwargs["method"] = 4
+        image.save(buffer, format=target_format.upper(), **kwargs)
+        return buffer.getvalue()
+
+
+# =============================================================================
+# CONTEXT MANAGER CORE
+# =============================================================================
 def _discover_owui_schema() -> Optional[str]:
     try:
         from open_webui.config import DATABASE_SCHEMA
 
-        schema = (
+        return (
             DATABASE_SCHEMA.value
             if hasattr(DATABASE_SCHEMA, "value")
             else DATABASE_SCHEMA
         )
-        return schema if schema else None
     except Exception:
         return None
 
 
 _owui_schema = _discover_owui_schema()
-
 if owui_Base is not None and Column is not None:
 
     class ChatManifest(owui_Base):
@@ -82,7 +383,6 @@ if owui_Base is not None and Column is not None:
             if _owui_schema
             else {"extend_existing": True}
         )
-
         id = Column(Integer, primary_key=True, autoincrement=True)
         chat_id = Column(String(255), unique=True, nullable=False)
         summary_content = Column(Text, nullable=False)
@@ -107,8 +407,6 @@ class SummaryState:
 
 @dataclass
 class MessagePools:
-    """Message pools returned as actual message lists."""
-
     protected_start: List[Dict[str, Any]]
     summarized: List[Dict[str, Any]]
     compressible: List[Dict[str, Any]]
@@ -117,33 +415,25 @@ class MessagePools:
 
 @dataclass
 class RuntimeSegments:
-    """Runtime message segments in deterministic merge order."""
-
     protected_start: List[Dict[str, Any]]
     summary_message: Optional[Dict[str, Any]]
-    media_messages: List[Dict[str, Any]]
+    summarized_media: List[Dict[str, Any]]
     uncompressed: List[Dict[str, Any]]
     protected_end: List[Dict[str, Any]]
 
     @property
     def final_messages(self) -> List[Dict[str, Any]]:
-        """Build final message list in runtime order:
-        protected_start → summary → media → uncompressed → protected_end
-        """
-        merged: List[Dict[str, Any]] = []
-        merged.extend(self.protected_start)
+        merged = list(self.protected_start)
         if self.summary_message:
             merged.append(self.summary_message)
+        merged.extend(self.summarized_media)
         merged.extend(self.uncompressed)
-        merged.extend(self.media_messages)
         merged.extend(self.protected_end)
         return merged
 
 
 @dataclass
 class RuntimeView:
-    """Runtime view with explicit segments and accurate stats."""
-
     final_messages: List[Dict[str, Any]]
     stats_message: str
     segments: RuntimeSegments
@@ -151,7 +441,7 @@ class RuntimeView:
     protected_tokens: int
     uncompressed_tokens: int
     summary_tokens: int
-    media_tokens: int
+    summarized_media_tokens: int
 
 
 class SummaryStore:
@@ -159,82 +449,73 @@ class SummaryStore:
         self._initialized = False
         self._init_error = None
 
-    def _ensure_table(self):
+    async def _ensure_table(self):
         if self._initialized:
             return self._init_error is None
-
         self._initialized = True
         try:
             if ChatManifest is None:
-                raise RuntimeError("Database table dependencies are unavailable")
-
-            with get_db_context() as db:
-                ChatManifest.__table__.create(bind=db.bind, checkfirst=True)
-                db.commit()
+                raise RuntimeError("DB dependencies unavailable")
+            async with get_async_db_context() as db:
+                # SQLAlchemy 2.0 async table creation
+                conn = await db.connection()
+                await conn.run_sync(ChatManifest.__table__.create, checkfirst=True)
+                await db.commit()
             return True
         except Exception as e:
             if "already exists" in str(e).lower():
                 return True
             self._init_error = str(e)
-            logger.error(f"[SummaryStore] Failed to ensure table: {e}")
             return False
 
-    def get(self, chat_id: str) -> Optional[Dict[str, Any]]:
-        if not self._ensure_table():
+    async def get(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        if not await self._ensure_table():
             return None
-
         try:
-            with get_db_context() as db:
-                record = db.query(ChatManifest).filter_by(chat_id=chat_id).first()
-                if record:
-                    return {
+            async with get_async_db_context() as db:
+                result = await db.execute(
+                    select(ChatManifest).filter_by(chat_id=chat_id)
+                )
+                record = result.scalars().first()
+                return (
+                    {
                         "content": record.summary_content,
                         "until_timestamp": record.until_timestamp,
-                        "updated_at": record.updated_at,
                     }
-                return None
-        except Exception as e:
-            logger.error(f"[SummaryStore] Failed to get summary: {e}")
+                    if record
+                    else None
+                )
+        except Exception:
             return None
 
-    def save(
+    async def save(
         self, chat_id: str, content: str, until_timestamp: Optional[int] = None
     ) -> bool:
-        if not self._ensure_table():
+        if not await self._ensure_table():
             return False
-
         try:
-            with get_db_context() as db:
-                record = db.query(ChatManifest).filter_by(chat_id=chat_id).first()
+            async with get_async_db_context() as db:
+                result = await db.execute(
+                    select(ChatManifest).filter_by(chat_id=chat_id)
+                )
+                record = result.scalars().first()
                 if record:
-                    record.summary_content = content
-                    record.until_timestamp = until_timestamp
+                    record.summary_content, record.until_timestamp = (
+                        content,
+                        until_timestamp,
+                    )
                     record.updated_at = datetime.now(timezone.utc)
                 else:
-                    record = ChatManifest(
-                        chat_id=chat_id,
-                        summary_content=content,
-                        until_timestamp=until_timestamp,
+                    db.add(
+                        ChatManifest(
+                            chat_id=chat_id,
+                            summary_content=content,
+                            until_timestamp=until_timestamp,
+                        )
                     )
-                    db.add(record)
-                db.commit()
-        except Exception as e:
-            logger.error(f"[SummaryStore] Failed to save summary: {e}")
-            return False
-
-        return True
-
-    def delete(self, chat_id: str) -> bool:
-        if not self._ensure_table():
-            return False
-
-        try:
-            with get_db_context() as db:
-                db.query(ChatManifest).filter_by(chat_id=chat_id).delete()
-                db.commit()
+                await db.commit()
             return True
-        except Exception as e:
-            logger.error(f"[SummaryStore] Failed to delete summary: {e}")
+        except Exception:
             return False
 
 
@@ -248,11 +529,9 @@ def _get_store() -> Optional[SummaryStore]:
     return _summary_store
 
 
-def get_summary_from_store(chat_id: str) -> Optional[Dict[str, Any]]:
+async def get_summary_from_store(chat_id: str) -> Optional[Dict[str, Any]]:
     store = _get_store()
-    if store is None:
-        return None
-    return store.get(chat_id)
+    return await store.get(chat_id) if store else None
 
 
 class TokenCounter:
@@ -279,83 +558,57 @@ class TokenCounter:
     def _count_message(msg: Dict[str, Any]) -> int:
         total = 0
         content = msg.get("content", "")
-
         if isinstance(content, str):
             total += TokenCounter._count_text(content)
         elif isinstance(content, dict):
             total += TokenCounter._count_text(TokenCounter.extract_text(content))
         elif isinstance(content, list):
             for part in content:
-                if isinstance(part, dict):
-                    part_type = str(part.get("type", "")).strip().lower()
-                    if part_type in {"text", "input_text"}:
-                        total += TokenCounter._count_text(
-                            part.get("text", "") or part.get("content", "")
-                        )
+                if isinstance(part, dict) and str(
+                    part.get("type", "")
+                ).strip().lower() in {"text", "input_text"}:
+                    total += TokenCounter._count_text(
+                        part.get("text", "") or part.get("content", "")
+                    )
                 elif isinstance(part, str):
                     total += TokenCounter._count_text(part)
-
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                tool_call_id = tool_call.get("id")
-                if isinstance(tool_call_id, str):
-                    total += TokenCounter._count_text(tool_call_id)
-                tool_call_type = tool_call.get("type")
-                if isinstance(tool_call_type, str):
-                    total += TokenCounter._count_text(tool_call_type)
-                function_payload = tool_call.get("function")
-                if isinstance(function_payload, dict):
-                    function_name = function_payload.get("name")
-                    if isinstance(function_name, str):
-                        total += TokenCounter._count_text(function_name)
-                    arguments = function_payload.get("arguments")
-                    if isinstance(arguments, str):
-                        total += TokenCounter._count_text(arguments)
-
-        tool_call_id = msg.get("tool_call_id")
-        if isinstance(tool_call_id, str):
-            total += TokenCounter._count_text(tool_call_id)
-
-        name = msg.get("name")
-        if isinstance(name, str):
-            total += TokenCounter._count_text(name)
-
-        total += 4
-        return total
+        for tc in (
+            msg.get("tool_calls", []) if isinstance(msg.get("tool_calls"), list) else []
+        ):
+            if not isinstance(tc, dict):
+                continue
+            total += TokenCounter._count_text(
+                tc.get("id", "")
+            ) + TokenCounter._count_text(tc.get("type", ""))
+            if isinstance(func := tc.get("function", {}), dict):
+                total += TokenCounter._count_text(
+                    func.get("name", "")
+                ) + TokenCounter._count_text(func.get("arguments", ""))
+        total += TokenCounter._count_text(
+            msg.get("tool_call_id", "")
+        ) + TokenCounter._count_text(msg.get("name", ""))
+        return total + 4
 
     @staticmethod
     def extract_text(content: Any) -> str:
         if isinstance(content, str):
             return content
         if isinstance(content, dict):
-            content_type = str(content.get("type", "")).strip().lower()
-            if content_type in {"text", "input_text"}:
-                text_value = content.get("text")
-                if isinstance(text_value, str):
-                    return text_value
-                nested_content = content.get("content")
-                if isinstance(nested_content, str):
-                    return nested_content
-            return ""
+            return (
+                str(content.get("text") or content.get("content") or "")
+                if str(content.get("type", "")).strip().lower()
+                in {"text", "input_text"}
+                else ""
+            )
         if isinstance(content, list):
-            texts = []
-            for part in content:
-                if isinstance(part, dict):
-                    part_type = str(part.get("type", "")).strip().lower()
-                    if part_type in {"text", "input_text"}:
-                        text_value = part.get("text")
-                        if isinstance(text_value, str) and text_value:
-                            texts.append(text_value)
-                            continue
-                        nested_content = part.get("content")
-                        if isinstance(nested_content, str) and nested_content:
-                            texts.append(nested_content)
-                elif isinstance(part, str):
-                    texts.append(part)
-            return " ".join(t for t in texts if t)
+            parts = []
+            for p in content:
+                if isinstance(p, str):
+                    parts.append(p)
+                elif isinstance(p, dict):
+                    if str(p.get("type", "")).strip().lower() in {"text", "input_text"}:
+                        parts.append(str(p.get("text") or p.get("content") or ""))
+            return " ".join(parts).strip()
         return ""
 
 
@@ -364,136 +617,58 @@ class ContextReconstructor:
     def collapsed_tool_text() -> str:
         return "[TOOL OUTPUT COLLAPSED]"
 
-    @staticmethod
-    def _shorten_tool_call_id(value: str, max_len: int = 64) -> str:
-        if not isinstance(value, str):
-            return value
-        raw = value.strip()
-        if len(raw) <= max_len:
-            return raw
-        prefix_len = max(16, max_len // 2)
-        suffix_len = max(8, max_len - prefix_len - 3)
-        if prefix_len + suffix_len + 3 > max_len:
-            suffix_len = max(4, max_len - prefix_len - 3)
-        return f"{raw[:prefix_len]}...{raw[-suffix_len:]}"
-
-    def normalize_tool_call_ids(self, messages: List[Dict[str, Any]]) -> int:
-        rewritten_ids: Dict[str, str] = {}
-        for message in messages:
-            tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                continue
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                original_id = tool_call.get("id")
-                if not isinstance(original_id, str) or not original_id.strip():
-                    continue
-                if len(original_id.strip()) <= 64:
-                    continue
-                normalized_id = rewritten_ids.get(original_id)
-                if normalized_id is None:
-                    normalized_id = self._shorten_tool_call_id(original_id)
-                    rewritten_ids[original_id] = normalized_id
-                tool_call["id"] = normalized_id
-
-        if not rewritten_ids:
-            return 0
-
-        for message in messages:
-            tool_call_id = message.get("tool_call_id")
-            if not isinstance(tool_call_id, str):
-                continue
-            normalized_id = rewritten_ids.get(tool_call_id)
-            if normalized_id and normalized_id != tool_call_id:
-                message["tool_call_id"] = normalized_id
-
-        return sum(1 for old_id, new_id in rewritten_ids.items() if old_id != new_id)
-
     def trim_tool_content(
         self,
         messages: List[Dict[str, Any]],
         threshold: int,
         target_indices: Optional[Set[int]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-        trimmed: List[Dict[str, Any]] = [deepcopy(msg) for msg in messages]
-        stats = {
-            "trimmed_count": 0,
-            "chars_removed": 0,
-            "tool_messages_trimmed": 0,
-            "tool_arguments_trimmed": 0,
-            "detail_blocks_trimmed": 0,
-            "tool_call_ids_normalized": 0,
-        }
-
-        stats["tool_call_ids_normalized"] = self.normalize_tool_call_ids(trimmed)
-        collapsed_text = self.collapsed_tool_text()
-
-        for i, msg_copy in enumerate(trimmed):
+        trimmed = [deepcopy(msg) for msg in messages]
+        stats = {"trimmed_count": 0}
+        collapsed = self.collapsed_tool_text()
+        for i, msg in enumerate(trimmed):
             if target_indices is not None and i not in target_indices:
                 continue
-
-            if msg_copy.get("role") == "tool":
-                content = msg_copy.get("content")
-                content_text = TokenCounter.extract_text(content)
-                if content_text and TokenCounter._count_text(content_text) > threshold:
-                    removed = max(0, len(content_text) - len(collapsed_text))
-                    msg_copy["content"] = collapsed_text
-                    stats["trimmed_count"] += 1
-                    stats["tool_messages_trimmed"] += 1
-                    stats["chars_removed"] += removed
-
-            tool_calls = msg_copy.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tool_call in tool_calls:
-                    if not isinstance(tool_call, dict):
-                        continue
-                    function_payload = tool_call.get("function")
-                    if not isinstance(function_payload, dict):
-                        continue
-                    arguments = function_payload.get("arguments")
-                    if (
-                        isinstance(arguments, str)
-                        and TokenCounter._count_text(arguments) > threshold
-                    ):
-                        removed = max(0, len(arguments) - len(collapsed_text))
-                        function_payload["arguments"] = collapsed_text
-                        stats["trimmed_count"] += 1
-                        stats["tool_arguments_trimmed"] += 1
-                        stats["chars_removed"] += removed
-
-            content = msg_copy.get("content")
             if (
-                not isinstance(content, str)
-                or '<details type="tool_calls"' not in content
-            ):
-                continue
-
-            def _replace_tool_result(match: re.Match) -> str:
-                block = match.group(0)
-                result_match = TOOL_RESULT_ATTR_RE.search(block)
-                if not result_match:
-                    return block
-                result_payload = result_match.group(1)
-
-                if TokenCounter._count_text(result_payload) <= threshold:
-                    return block
-
-                removed = max(0, len(result_payload) - len(collapsed_text))
-                stats["trimmed_count"] += 1
-                stats["detail_blocks_trimmed"] += 1
-                stats["chars_removed"] += removed
-
-                return TOOL_RESULT_ATTR_RE.sub(
-                    f'result="{collapsed_text}"',
-                    block,
-                    count=1,
+                msg.get("role") == "tool"
+                and TokenCounter._count_text(
+                    TokenCounter.extract_text(msg.get("content"))
                 )
+                > threshold
+            ):
+                msg["content"] = collapsed
+                stats["trimmed_count"] += 1
+            for tc in (
+                msg.get("tool_calls", [])
+                if isinstance(msg.get("tool_calls"), list)
+                else []
+            ):
+                if isinstance(tc, dict) and isinstance(
+                    func := tc.get("function"), dict
+                ):
+                    if (
+                        isinstance(args := func.get("arguments"), str)
+                        and TokenCounter._count_text(args) > threshold
+                    ):
+                        func["arguments"] = collapsed
+                        stats["trimmed_count"] += 1
+            if (
+                isinstance(content := msg.get("content"), str)
+                and '<details type="tool_calls"' in content
+            ):
 
-            msg_copy["content"] = TOOL_DETAILS_BLOCK_RE.sub(
-                _replace_tool_result, content
-            )
+                def _replace(match):
+                    block = match.group(0)
+                    if (
+                        res := TOOL_RESULT_ATTR_RE.search(block)
+                    ) and TokenCounter._count_text(res.group(1)) > threshold:
+                        stats["trimmed_count"] += 1
+                        return TOOL_RESULT_ATTR_RE.sub(
+                            f'result="{collapsed}"', block, count=1
+                        )
+                    return block
 
+                msg["content"] = TOOL_DETAILS_BLOCK_RE.sub(_replace, content)
         return trimmed, stats
 
 
@@ -520,8 +695,7 @@ class Filter:
             description="Number of recent messages to protect at the end of the chat.",
         )
         summary_model: Optional[str] = Field(
-            default=None,
-            description="Model ID to use for background summarization.",
+            default=None, description="Model ID to use for background summarization."
         )
         include_protected_in_threshold: bool = Field(
             default=True,
@@ -529,21 +703,74 @@ class Filter:
         )
         tool_trim_threshold: int = Field(
             default=1000,
-            description="Tool outputs, tool-call arguments, or <details> result blocks larger than this token count are eligible for trimming.",
+            description="Tool outputs larger than this token count are eligible for trimming.",
         )
         trim_protected_messages: bool = Field(
             default=False,
-            description="Apply tool content trimming to protected messages (protected_start and protected_end).",
+            description="Apply tool content trimming to protected messages.",
         )
         debug_logging: bool = Field(
-            default=False,
-            description="Enable detailed console logging.",
+            default=False, description="Enable detailed console logging."
+        )
+        enable_image_compression: bool = Field(
+            default=False, description="Opt-in to native semantic image compression."
+        )
+        image_quality_protected: int = Field(
+            default=85,
+            ge=1,
+            le=100,
+            description="Quality for images in protected zones (High Fidelity).",
+        )
+        image_quality_uncompressed: int = Field(
+            default=60,
+            ge=1,
+            le=100,
+            description="Quality for images in uncompressed zone (Medium Fidelity).",
+        )
+        image_quality_summarized: int = Field(
+            default=20,
+            ge=1,
+            le=100,
+            description="Quality for images in summarized zone (Low Fidelity).",
+        )
+        max_image_size_bytes: int = Field(
+            default=1048576,
+            ge=1024,
+            description="Maximum image size in bytes before compression triggers.",
+        )
+        convert_png_to_jpeg: bool = Field(
+            default=True,
+            description="Convert PNG images to JPEG for better compression.",
+        )
+        preserve_transparency: bool = Field(
+            default=True,
+            description="Convert transparent PNGs to WebP instead of JPEG.",
+        )
+        enable_vision_detection: bool = Field(
+            default=True, description="Check if the model supports vision."
+        )
+        drop_images_for_non_vision: bool = Field(
+            default=True, description="Drop images if the model doesn't support vision."
+        )
+        enable_smart_drop: bool = Field(
+            default=True, description="Generate OCR descriptions for dropped images."
+        )
+        use_ocr: bool = Field(default=True, description="Use RapidOCR to extract text.")
+        image_token_detail: str = Field(
+            default="auto", description="Token estimation detail level (auto/low/high)."
         )
 
     def __init__(self):
         self.valves = self.Valves()
         self.reconstructor = ContextReconstructor()
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._image_stats = {
+            "compressed": 0,
+            "saved_bytes": 0,
+            "original_bytes": 0,
+            "tokens": 0,
+            "count": 0,
+        }
 
     def _lock_for(self, chat_id: str) -> asyncio.Lock:
         if chat_id not in self._locks:
@@ -553,71 +780,35 @@ class Filter:
     async def _emit_status(
         self, emitter: Optional[Callable], message: str, done: bool = True
     ):
-        if emitter is None or not self.valves.emit_status_events:
-            return
-        try:
-            await emitter(
-                {"type": "status", "data": {"description": message, "done": done}}
-            )
-        except Exception as e:
-            logger.debug(f"[Status Emit] Failed: {e}")
+        if emitter and self.valves.emit_status_events:
+            try:
+                await emitter(
+                    {"type": "status", "data": {"description": message, "done": done}}
+                )
+            except Exception:
+                pass
 
-    def _normalize_epoch_timestamp(self, value: Any) -> Optional[int]:
-        try:
-            if isinstance(value, datetime):
-                return int(value.timestamp())
-            if isinstance(value, str):
-                raw = value.strip()
-                if not raw:
-                    return None
-                try:
-                    value = float(raw)
-                except (TypeError, ValueError):
-                    try:
-                        return int(
-                            datetime.fromisoformat(
-                                raw.replace("Z", "+00:00")
-                            ).timestamp()
-                        )
-                    except Exception:
-                        return None
-            if isinstance(value, (int, float)):
-                numeric = float(value)
-                if numeric <= 0:
-                    return None
-                if numeric > 1e18:
-                    numeric /= 1_000_000_000
-                elif numeric > 1e15:
-                    numeric /= 1_000_000
-                elif numeric > 1e12:
-                    numeric /= 1000
-                ts = int(numeric)
-                return ts
-        except Exception:
-            return None
-        return None
+    def _get_chat_id(self, body: dict, metadata: dict) -> Optional[str]:
+        return (
+            (metadata or {}).get("chat_id")
+            or body.get("chat_id")
+            or body.get("meta", {}).get("chat_id")
+        )
 
     def _timestamp_of(self, msg: Dict[str, Any]) -> Optional[int]:
         if not isinstance(msg, dict):
             return None
-        msg_ts = msg.get("timestamp")
-        if msg_ts is None:
-            msg_ts = msg.get("created_at")
-        return self._normalize_epoch_timestamp(msg_ts)
-
-    def _message_identity(self, msg: Dict[str, Any]) -> str:
-        if not isinstance(msg, dict):
-            return ""
-        for key in ("id", "message_id", "uuid"):
-            value = msg.get(key)
-            if value is not None:
-                value_str = str(value).strip()
-                if value_str:
-                    return f"id:{value_str}"
-        role = str(msg.get("role", ""))
-        ts = self._timestamp_of(msg)
-        content = TokenCounter.extract_text(msg.get("content", ""))
-        return f"fallback:{role}:{ts}:{content[:200]}"
+        val = msg.get("timestamp") or msg.get("created_at")
+        try:
+            if isinstance(val, (int, float)):
+                return int(val) if val < 1e12 else int(val / 1000)
+            if isinstance(val, str):
+                return int(
+                    datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+                )
+        except Exception:
+            pass
+        return None
 
     def _unfold_messages(self, messages: Any) -> List[Dict[str, Any]]:
         if not messages:
@@ -628,162 +819,111 @@ class Filter:
                 continue
             msg = deepcopy(msg)
             children = msg.pop("children", None)
-            if children:
-                if isinstance(children, list) and children:
-                    child = children[0] if isinstance(children[0], dict) else {}
-                    child_msg = {**msg, **child}
-                    child_msg.pop("children", None)
-                    result.append(child_msg)
-                else:
-                    result.append(msg)
+            if (
+                children
+                and isinstance(children, list)
+                and isinstance(children[0], dict)
+            ):
+                child_msg = {**msg, **children[0]}
+                child_msg.pop("children", None)
+                result.append(child_msg)
             else:
                 result.append(msg)
         return result
 
-    # Fields to keep for LLM context (scrub everything else)
-    KEEP_FIELDS = frozenset({"id", "parentId", "role", "content", "timestamp"})
-
-    def _scrub_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove unnecessary fields from a message, keeping only essential fields."""
-        if not isinstance(msg, dict):
-            return {}
-        return {k: v for k, v in msg.items() if k in self.KEEP_FIELDS}
-
-    def _prepare_db_messages(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Prepare DB messages for LLM context.
-
-        - Unfolds children structure
-        - Deduplicates by identity
-        - Preserves original order (no timestamp sorting)
-        - Scrubs unnecessary fields
-        """
-        if not messages:
-            return []
-        # Step 1: Unfold children structure
-        unfolded = self._unfold_messages(messages)
-
-        # Step 2: Remove any empty messages
-        cleaned = [x for x in unfolded if x["content"]]
-
-        # Step 4: Scrub unnecessary fields
-        return [self._scrub_message(msg) for msg in cleaned]
-
-    def _load_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
-        return self._prepare_db_messages(self._load_db_messages_by_chat_id(chat_id))
-
-    def _extract_media_messages_from_body(self, body: dict) -> List[Dict[str, Any]]:
-        """Extract media messages from body without normalization.
-
-        Body messages are already in correct order - just filter and dedupe.
-        No need to normalize or scrub - preserve original structure.
-        """
-        if not isinstance(body, dict):
-            return []
-        body_messages = body.get("messages")
-        if not isinstance(body_messages, list):
-            return []
-
-        media_messages: List[Dict[str, Any]] = []
-        seen = set()
-        for msg in body_messages:
-            if not isinstance(msg, dict):
-                continue
-            if not self._message_has_passthrough_media(msg):
-                continue
-
-            identity = self._message_identity(msg)
-            if identity and identity in seen:
-                continue
-            if identity:
-                seen.add(identity)
-
-            media_messages.append(deepcopy(msg))
-
-        # Return as-is - no normalization, no scrubbing
-        return media_messages
-
-    def _get_summary_state(self, chat_id: str) -> SummaryState:
-        summary_data = get_summary_from_store(chat_id)
-        if not summary_data:
-            return SummaryState(content="", until_ts=None, raw=None)
-        return SummaryState(
-            content=summary_data.get("content", "") or "",
-            until_ts=summary_data.get("until_timestamp"),
-            raw=summary_data,
-        )
-
-    def _build_summary_message(
-        self, summary_state: SummaryState
-    ) -> Optional[Dict[str, Any]]:
-        """Build the summary message to inject into the runtime payload."""
-        if not summary_state or not summary_state.content:
-            return None
-        return {
-            "role": "system",
-            "content": f"<{SUMMARY_TAG}>\n{summary_state.content}\n</{SUMMARY_TAG}>",
+    async def _scrub_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        scrubbed = {
+            k: v
+            for k, v in msg.items()
+            if k in {"id", "parentId", "role", "content", "timestamp"}
         }
-
-    def _count_tokens_in_messages(self, messages: List[Dict[str, Any]]) -> int:
-        """Count total tokens in a list of messages."""
-        if not messages:
-            return 0
-        return sum(TokenCounter.count(msg) for msg in messages if isinstance(msg, dict))
-
-    def _format_token_count(self, n: int) -> str:
-        """Format token count for display."""
-        if n >= 1000:
-            return f"{n / 1000:.1f}k"
-        return str(int(n))
-
-    def _build_runtime_stats_message(
-        self,
-        summarized_messages: List[Dict[str, Any]],
-        protected_messages: List[Dict[str, Any]],
-        summary_message: Optional[Dict[str, Any]],
-        uncompressed_messages: List[Dict[str, Any]],
-        media_messages: List[Dict[str, Any]],
-        was_shed: bool = False,
-    ) -> Tuple[str, int, int, int, int, int]:
-        """Build runtime stats message from explicit segments.
-
-        Returns tuple of (stats_message, total_tokens, protected_tokens,
-                         uncompressed_tokens, summary_tokens, media_tokens)
-        """
-        protected_count = len(protected_messages)
-        uncompressed_count = len(uncompressed_messages)
-
-        protected_tokens = self._count_tokens_in_messages(protected_messages)
-        summarized_tokens = self._count_tokens_in_messages(summarized_messages)
-        summary_tokens = (
-            self._count_tokens_in_messages([summary_message]) if summary_message else 0
+        if not isinstance(scrubbed.get("content"), str):
+            return scrubbed
+        files, images = msg.get("files", []), msg.get("images", [])
+        if not files and not images:
+            return scrubbed
+        new_content = (
+            [{"type": "text", "text": scrubbed["content"]}]
+            if scrubbed["content"]
+            else []
         )
-        uncompressed_tokens = self._count_tokens_in_messages(uncompressed_messages)
-        media_tokens = self._count_tokens_in_messages(media_messages)
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            file_id = f.get("id")
+            url = f.get("url")
+            # Fetch base64 directly from disk if possible!
+            b64_url = await get_file_base64(file_id) if file_id else None
+            if b64_url:
+                url = b64_url
+            elif not url and file_id:
+                url = f"/api/v1/files/{file_id}/content"
+            if not url:
+                continue
+            if (
+                f.get("type") == "image"
+                or "image/" in f.get("meta", {}).get("content_type", "")
+                or url.startswith("data:image/")
+            ):
+                new_content.append({"type": "image_url", "image_url": {"url": url}})
+        for img in images:
+            if isinstance(img, str):
+                # If it's a file ID, fetch from disk
+                if not img.startswith("data:") and not img.startswith("http"):
+                    b64_url = await get_file_base64(img)
+                    if b64_url:
+                        img = b64_url
+                new_content.append({"type": "image_url", "image_url": {"url": img}})
+        if len(new_content) > (1 if scrubbed["content"] else 0):
+            scrubbed["content"] = new_content
+        return scrubbed
 
-        total_tokens = (
-            protected_tokens + summary_tokens + uncompressed_tokens + media_tokens
-        )
+    async def _load_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        if not chat_id or Chats is None:
+            return []
+        try:
+            chat_record = await Chats.get_chat_by_id(chat_id)
+        except Exception:
+            return []
+        chat_payload = getattr(chat_record, "chat", {})
+        if not isinstance(chat_payload, dict):
+            return []
+        history = chat_payload.get("history", {})
+        history_msgs = history.get("messages", {})
+        current_id = history.get("currentId") or history.get("current_id")
+        if isinstance(current_id, str) and current_id in history_msgs:
+            ordered, cursor, visited = [], current_id, set()
+            while isinstance(cursor, str) and cursor and cursor not in visited:
+                visited.add(cursor)
+                node = history_msgs.get(cursor)
+                if not isinstance(node, dict):
+                    break
+                ordered.append(deepcopy(node))
+                cursor = node.get("parentId") or node.get("parent_id")
+            ordered.reverse()
 
-        stats = (
-            f"🪙 {self._format_token_count(total_tokens)} │ "
-            f"🛡️ {self._format_token_count(protected_tokens)} ({protected_count}) · "
-            f"⏳ {self._format_token_count(uncompressed_tokens)} ({uncompressed_count}) · "
-            f"📦 {self._format_token_count(summary_tokens)} ({len(summarized_messages)}{ f' @ {round((summarized_tokens - summary_tokens)/summarized_tokens * 100, 2)}%' if summarized_tokens > 0 else ''})"
-        )
+            res = []
+            for m in self._unfold_messages(ordered):
+                if m.get("content"):
+                    res.append(await self._scrub_message(m))
+            return res
 
-        if was_shed:
-            stats = f"⚠️ Limit Reached │ {stats}"
+        if isinstance(chat_payload.get("messages"), list):
+            res = []
+            for m in self._unfold_messages(deepcopy(chat_payload["messages"])):
+                if m.get("content"):
+                    res.append(await self._scrub_message(m))
+            return res
+        return []
 
+    async def _get_summary_state(self, chat_id: str) -> SummaryState:
+        data = await get_summary_from_store(chat_id)
         return (
-            stats,
-            total_tokens,
-            protected_tokens,
-            uncompressed_tokens,
-            summary_tokens,
-            media_tokens,
+            SummaryState(
+                content=data["content"], until_ts=data["until_timestamp"], raw=data
+            )
+            if data
+            else SummaryState("", None)
         )
 
     def _split_message_pools(
@@ -793,394 +933,374 @@ class Filter:
         keep_start: int,
         keep_end: int,
     ) -> MessagePools:
-        """Split messages into pools as actual message lists."""
         total = len(messages)
         start_cut = min(max(keep_start, 0), total)
         end_count = min(max(keep_end, 0), max(0, total - start_cut))
         end_start = total - end_count
-
         protected_start = list(messages[:start_cut])
         protected_end = list(messages[end_start:]) if end_count > 0 else []
         middle = list(messages[start_cut:end_start])
-
-        summarized: List[Dict[str, Any]] = []
-        compressible: List[Dict[str, Any]] = []
-
+        summarized, compressible = [], []
         for msg in middle:
             ts = self._timestamp_of(msg)
             if summary_time is not None and ts is not None and ts <= summary_time:
                 summarized.append(msg)
             else:
                 compressible.append(msg)
-
-        return MessagePools(
-            protected_start=protected_start,
-            summarized=summarized,
-            compressible=compressible,
-            protected_end=protected_end,
-        )
+        return MessagePools(protected_start, summarized, compressible, protected_end)
 
     def _message_has_passthrough_media(self, message: Dict[str, Any]) -> bool:
-        if not isinstance(message, dict):
-            return False
         content = message.get("content")
         media_types = {"image_url", "file", "input_image", "input_file"}
         if isinstance(content, dict):
             return str(content.get("type", "")).strip().lower() in media_types
         if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if str(part.get("type", "")).strip().lower() in media_types:
-                    return True
+            return any(
+                isinstance(p, dict)
+                and str(p.get("type", "")).strip().lower() in media_types
+                for p in content
+            )
         return False
 
-    def _build_text_only_message(
-        self, message: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        if not isinstance(message, dict):
-            return None
-        text_content = TokenCounter.extract_text(message.get("content", ""))
-        if not text_content:
-            return None
-
-        text_message = {
-            "role": message.get("role", "user"),
-            "content": text_content,
-        }
-
-        for key in ("timestamp", "created_at", "id", "message_id", "uuid"):
-            if key in message:
-                text_message[key] = message[key]
-
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list):
-            text_tool_calls = []
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                tool_call_copy = deepcopy(tool_call)
-                text_tool_calls.append(tool_call_copy)
-            if text_tool_calls:
-                text_message["tool_calls"] = text_tool_calls
-
-        if "tool_call_id" in message:
-            text_message["tool_call_id"] = message["tool_call_id"]
-        if "name" in message:
-            text_message["name"] = message["name"]
-
-        return text_message
-
-    def _build_text_only_messages(
-        self,
-        messages: List[Dict[str, Any]],
+    def _align_messages(
+        self, db_msgs: List[Dict[str, Any]], body_msgs: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        text_messages: List[Dict[str, Any]] = []
-        for msg in messages:
-            text_msg = self._build_text_only_message(msg)
-            if text_msg is not None:
-                text_messages.append(text_msg)
-        return text_messages
+        aligned = []
+        # 1. System prompts from frontend
+        for b in body_msgs:
+            if b.get("role") == "system":
+                aligned.append(deepcopy(b))
+        # 2. DB messages (now with base64 injected from disk!)
+        for d in db_msgs:
+            aligned.append(deepcopy(d))
+        if not body_msgs:
+            return aligned
+        # 3. Append the final user/assistant message if it's new
+        last_b = body_msgs[-1]
+        if last_b.get("role") != "system":
+            b_text = TokenCounter.extract_text(last_b.get("content", "")).strip()
+            is_new = True
+            if aligned:
+                last_aligned = aligned[-1]
+                if last_aligned.get("role") == last_b.get("role"):
+                    a_text = TokenCounter.extract_text(
+                        last_aligned.get("content", "")
+                    ).strip()
+                    if b_text == a_text:
+                        is_new = False
+                        # If it's not new, optionally upgrade content if frontend has richer media
+                        frontend_content = last_b.get("content")
+                        if isinstance(frontend_content, list):
+                            has_image = any(
+                                isinstance(p, dict)
+                                and str(p.get("type", "")).strip().lower()
+                                in {"image_url", "image"}
+                                for p in frontend_content
+                            )
+                            if has_image:
+                                aligned[-1]["content"] = deepcopy(frontend_content)
+            if is_new:
+                aligned.append(deepcopy(last_b))
+        return aligned
 
-    def _package_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        packaged: List[Dict[str, Any]] = []
-        for msg in messages:
-            if not isinstance(msg, dict):
+    def _build_media_only_message(
+        self, msg: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return None
+        media_parts = [
+            p
+            for p in content
+            if isinstance(p, dict)
+            and str(p.get("type", "")).strip().lower()
+            in {"image_url", "image", "file", "input_image", "input_file"}
+        ]
+        return (
+            {"role": msg.get("role", "user"), "content": media_parts}
+            if media_parts
+            else None
+        )
+
+    async def _process_pool_images(
+        self,
+        pool: List[Dict[str, Any]],
+        quality: int,
+        compressor: Optional[ImageCompressor],
+        supports_vision: bool,
+    ) -> List[Dict[str, Any]]:
+        if not self.valves.enable_image_compression or not pool:
+            return pool
+        processed_pool = []
+        for msg in pool:
+            if not isinstance(msg, dict) or not msg.get("content"):
+                processed_pool.append(msg)
                 continue
             msg_copy = deepcopy(msg)
-            msg_copy.pop("children", None)
-            packaged.append(msg_copy)
-        return packaged
+            content = msg_copy["content"]
+            if not supports_vision and self.valves.drop_images_for_non_vision:
+                if isinstance(content, list):
+                    new_content = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "image_url":
+                            text = "[Image dropped - model doesn't support vision]"
+                            if self.valves.enable_smart_drop:
+                                if file_id := part.get("id"):
+                                    text = await get_cached_ocr_description(file_id)
+                                else:
+                                    img_url = part.get("image_url", {})
+                                    url = (
+                                        img_url.get("url", "")
+                                        if isinstance(img_url, dict)
+                                        else str(img_url)
+                                    )
+                                    b64, _, _ = extract_base64_data(url)
+                                    text = generate_smart_image_description(
+                                        b64, self.valves.use_ocr
+                                    )
+                            new_content.append({"type": "text", "text": text})
+                        else:
+                            new_content.append(part)
+                    msg_copy["content"] = new_content
+                processed_pool.append(msg_copy)
+                continue
+            if compressor and PILLOW_AVAILABLE and isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        img_url = part.get("image_url", {})
+                        url = (
+                            img_url.get("url", "")
+                            if isinstance(img_url, dict)
+                            else str(img_url)
+                        )
+                        b64, fmt, _ = extract_base64_data(url)
+                        if (
+                            b64
+                            and calculate_base64_size(b64)
+                            > self.valves.max_image_size_bytes
+                        ):
+                            try:
 
-    def _enforce_context_limits(
+                                def _compress():
+                                    return compressor.compress_image(b64, fmt, quality)
+
+                                new_b64, new_fmt, stats = await asyncio.to_thread(
+                                    _compress
+                                )
+                                new_url = f"data:{MIME_TYPES.get(new_fmt, 'image/jpeg')};base64,{new_b64}"
+                                if isinstance(part["image_url"], dict):
+                                    part["image_url"]["url"] = new_url
+                                else:
+                                    part["image_url"] = new_url
+                                self._image_stats["compressed"] += 1
+                                self._image_stats["saved_bytes"] += (
+                                    stats["original_size"] - stats["compressed_size"]
+                                )
+                                self._image_stats["original_bytes"] += stats[
+                                    "original_size"
+                                ]
+                            except Exception as e:
+                                logger.debug(f"Image compression failed: {e}")
+            processed_pool.append(msg_copy)
+        return processed_pool
+
+    def _calculate_image_tokens(self, messages: List[Dict[str, Any]]) -> None:
+        if not self.valves.enable_image_compression:
+            return
+        for msg in messages:
+            if isinstance(content := msg.get("content"), list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        self._image_stats["count"] += 1
+                        img_url = part.get("image_url", {})
+                        url = (
+                            img_url.get("url", "")
+                            if isinstance(img_url, dict)
+                            else str(img_url)
+                        )
+                        b64, _, _ = extract_base64_data(url)
+                        if b64 and PILLOW_AVAILABLE:
+                            try:
+                                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+                                self._image_stats[
+                                    "tokens"
+                                ] += estimate_image_tokens_from_dimensions(
+                                    img.width,
+                                    img.height,
+                                    self.valves.image_token_detail,
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            self._image_stats["tokens"] += 85
+
+    async def _build_runtime_view(
         self,
-        protected_start: List[Dict[str, Any]],
-        summary_message: Optional[Dict[str, Any]],
-        media_messages: List[Dict[str, Any]],
-        uncompressed: List[Dict[str, Any]],
-        protected_end: List[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], bool]:
-        """Sheds oldest messages to ensure the payload fits within max_context_tokens."""
-        max_tokens = self.valves.max_context_tokens
-        if max_tokens <= 0:
-            return media_messages, uncompressed, protected_end, False
-
-        p_start_tok = self._count_tokens_in_messages(protected_start)
-        sum_tok = (
-            self._count_tokens_in_messages([summary_message]) if summary_message else 0
-        )
-        media_tok = self._count_tokens_in_messages(media_messages)
-        uncomp_tok = self._count_tokens_in_messages(uncompressed)
-        p_end_tok = self._count_tokens_in_messages(protected_end)
-
-        total = p_start_tok + sum_tok + media_tok + uncomp_tok + p_end_tok
-        was_shed = False
-
-        # Shedding priority: 1. Oldest Uncompressed -> 2. Oldest Media -> 3. Oldest Protected End
-        while total > max_tokens:
-            was_shed = True
-            if uncompressed:
-                dropped = uncompressed.pop(0)
-                dropped_tok = TokenCounter.count(dropped)
-                uncomp_tok -= dropped_tok
-                total -= dropped_tok
-            elif media_messages:
-                dropped = media_messages.pop(0)
-                dropped_tok = TokenCounter.count(dropped)
-                media_tok -= dropped_tok
-                total -= dropped_tok
-            elif len(protected_end) > 1:  # Always keep at least the very last message
-                dropped = protected_end.pop(0)
-                dropped_tok = TokenCounter.count(dropped)
-                p_end_tok -= dropped_tok
-                total -= dropped_tok
-            else:
-                break  # Cannot safely shed anymore
-
-        return media_messages, uncompressed, protected_end, was_shed
-
-    def _build_runtime_view(
-        self,
-        db_messages: List[Dict[str, Any]],
-        media_messages: List[Dict[str, Any]],
+        aligned_messages: List[Dict[str, Any]],
         summary_state: SummaryState,
+        model: Optional[Dict[str, Any]] = None,
     ) -> RuntimeView:
-        """Build the runtime message view using deterministic segments."""
-        message_count = len(db_messages)
-        keep_start = min(self.valves.keep_start_messages, message_count)
-        keep_end = min(
-            self.valves.keep_last_messages, max(0, message_count - keep_start)
-        )
-
+        self._image_stats = {
+            "compressed": 0,
+            "saved_bytes": 0,
+            "original_bytes": 0,
+            "tokens": 0,
+            "count": 0,
+        }
         pools = self._split_message_pools(
-            db_messages,
+            aligned_messages,
             summary_state.until_ts,
-            keep_start,
-            keep_end,
+            min(self.valves.keep_start_messages, len(aligned_messages)),
+            min(
+                self.valves.keep_last_messages,
+                max(0, len(aligned_messages) - self.valves.keep_start_messages),
+            ),
         )
-
-        # Apply tool trimming to the compressible (uncompressed) messages
-        trim_targets = set(range(len(pools.compressible)))
-        trimmed_compressible, trim_stats = self.reconstructor.trim_tool_content(
+        summarized_media = [
+            m
+            for p in pools.summarized
+            if (m := self._build_media_only_message(p))
+            and self._message_has_passthrough_media(p)
+        ]
+        trimmed_compressible, _ = self.reconstructor.trim_tool_content(
             pools.compressible,
             self.valves.tool_trim_threshold,
-            target_indices=trim_targets,
+            set(range(len(pools.compressible))),
         )
-
-        # Package the segments (optionally trim protected messages)
-        if self.valves.trim_protected_messages and pools.protected_start:
-            trimmed_protected_start, _ = self.reconstructor.trim_tool_content(
-                pools.protected_start,
-                self.valves.tool_trim_threshold,
-                target_indices=set(range(len(pools.protected_start))),
+        protected_start = (
+            self.reconstructor.trim_tool_content(
+                pools.protected_start, self.valves.tool_trim_threshold
+            )[0]
+            if self.valves.trim_protected_messages
+            else pools.protected_start
+        )
+        protected_end = (
+            self.reconstructor.trim_tool_content(
+                pools.protected_end, self.valves.tool_trim_threshold
+            )[0]
+            if self.valves.trim_protected_messages
+            else pools.protected_end
+        )
+        if self.valves.enable_image_compression:
+            compressor = (
+                ImageCompressor(
+                    self.valves.max_image_size_bytes,
+                    self.valves.convert_png_to_jpeg,
+                    self.valves.preserve_transparency,
+                )
+                if PILLOW_AVAILABLE
+                else None
             )
-            protected_start = self._package_messages(trimmed_protected_start)
-        else:
-            protected_start = self._package_messages(pools.protected_start)
-
-        if self.valves.trim_protected_messages and pools.protected_end:
-            trimmed_protected_end, _ = self.reconstructor.trim_tool_content(
-                pools.protected_end,
-                self.valves.tool_trim_threshold,
-                target_indices=set(range(len(pools.protected_end))),
+            supports_vision = (
+                model_supports_vision(model)
+                if self.valves.enable_vision_detection
+                else True
             )
-            protected_end = self._package_messages(trimmed_protected_end)
-        else:
-            protected_end = self._package_messages(pools.protected_end)
-
-        uncompressed = self._package_messages(trimmed_compressible)
-
-        # Build summary message
-        summary_message = self._build_summary_message(summary_state)
-
-        # --- Enforce max context limits ---
-        media_messages, uncompressed, protected_end, was_shed = (
-            self._enforce_context_limits(
+            protected_start = await self._process_pool_images(
                 protected_start,
-                summary_message,
-                media_messages,
+                self.valves.image_quality_protected,
+                compressor,
+                supports_vision,
+            )
+            protected_end = await self._process_pool_images(
+                protected_end,
+                self.valves.image_quality_protected,
+                compressor,
+                supports_vision,
+            )
+            trimmed_compressible = await self._process_pool_images(
+                trimmed_compressible,
+                self.valves.image_quality_uncompressed,
+                compressor,
+                supports_vision,
+            )
+            summarized_media = await self._process_pool_images(
+                summarized_media,
+                self.valves.image_quality_summarized,
+                compressor,
+                supports_vision,
+            )
+        protected_start = [
+            {k: v for k, v in m.items() if k != "children"} for m in protected_start
+        ]
+        protected_end = [
+            {k: v for k, v in m.items() if k != "children"} for m in protected_end
+        ]
+        uncompressed = [
+            {k: v for k, v in m.items() if k != "children"}
+            for m in trimmed_compressible
+        ]
+        summary_message = (
+            {
+                "role": "system",
+                "content": f"<{SUMMARY_TAG}>\n{summary_state.content}\n</{SUMMARY_TAG}>",
+            }
+            if summary_state.content
+            else None
+        )
+        max_tok = self.valves.max_context_tokens
+        total_tok = sum(
+            TokenCounter.count(m)
+            for pool in [
+                protected_start,
+                [summary_message] if summary_message else [],
+                summarized_media,
                 uncompressed,
                 protected_end,
-            )
+            ]
+            for m in pool
         )
-
-        # Build segments
+        was_shed = False
+        while total_tok > max_tok and max_tok > 0:
+            was_shed = True
+            if uncompressed:
+                total_tok -= TokenCounter.count(uncompressed.pop(0))
+            elif summarized_media:
+                total_tok -= TokenCounter.count(summarized_media.pop(0))
+            elif len(protected_end) > 1:
+                total_tok -= TokenCounter.count(protected_end.pop(0))
+            else:
+                break
         segments = RuntimeSegments(
-            protected_start=protected_start,
-            summary_message=summary_message,
-            media_messages=media_messages,
-            uncompressed=uncompressed,
-            protected_end=protected_end,
+            protected_start,
+            summary_message,
+            summarized_media,
+            uncompressed,
+            protected_end,
         )
-
-        # Build stats from explicit segments
-        protected_all = protected_start + protected_end
-        (
-            stats_message,
-            total_tokens,
-            protected_tokens,
-            uncompressed_tokens,
-            summary_tokens,
-            media_tokens,
-        ) = self._build_runtime_stats_message(
-            summarized_messages=pools.summarized,
-            protected_messages=protected_all,
-            summary_message=summary_message,
-            uncompressed_messages=uncompressed,
-            media_messages=media_messages,
-            was_shed=was_shed,
+        self._calculate_image_tokens(segments.final_messages)
+        p_tok = sum(TokenCounter.count(m) for m in protected_start + protected_end)
+        u_tok = sum(TokenCounter.count(m) for m in uncompressed)
+        s_tok = TokenCounter.count(summary_message) if summary_message else 0
+        sm_tok = sum(TokenCounter.count(m) for m in summarized_media)
+        raw_s_tok = sum(TokenCounter.count(m) for m in pools.summarized)
+        eff_str = (
+            f" @ {round((raw_s_tok - s_tok)/raw_s_tok * 100, 2)}%"
+            if raw_s_tok > 0
+            else ""
         )
-
+        stats = f"🪙 {format_tokens(p_tok + u_tok + s_tok + sm_tok)} │ 🛡️ {format_tokens(p_tok)} ({len(protected_start)+len(protected_end)}) · ⏳ {format_tokens(u_tok)} ({len(uncompressed)}) · 📦 {format_tokens(s_tok)} ({len(pools.summarized)}{eff_str})"
+        if was_shed:
+            stats = f"⚠️ Limit Reached │ {stats}"
+        if self.valves.enable_image_compression and self._image_stats["count"] > 0:
+            img_tok, img_cnt, orig_b, saved_b = (
+                self._image_stats["tokens"],
+                self._image_stats["count"],
+                self._image_stats["original_bytes"],
+                self._image_stats["saved_bytes"],
+            )
+            img_eff = f" @ {round((saved_b / orig_b) * 100)}%" if orig_b > 0 else ""
+            stats += f" │ 🖼️ {format_tokens(img_tok)} ({img_cnt}{img_eff})"
         return RuntimeView(
-            final_messages=segments.final_messages,
-            stats_message=stats_message,
-            segments=segments,
-            total_tokens=total_tokens,
-            protected_tokens=protected_tokens,
-            uncompressed_tokens=uncompressed_tokens,
-            summary_tokens=summary_tokens,
-            media_tokens=media_tokens,
+            segments.final_messages,
+            stats,
+            segments,
+            p_tok + u_tok + s_tok + sm_tok,
+            p_tok,
+            u_tok,
+            s_tok,
+            sm_tok,
         )
-
-    def _debug_runtime_view(
-        self,
-        chat_id: str,
-        label: str,
-        view: RuntimeView,
-        summary_state: SummaryState,
-    ):
-        if not self.valves.debug_logging:
-            return
-        try:
-            logger.debug(
-                "[Context Manager][%s][%s] total=%s protected=%s uncompressed=%s summary=%s media=%s final=%s summary_until=%s",
-                label,
-                chat_id,
-                view.total_tokens,
-                view.protected_tokens,
-                view.uncompressed_tokens,
-                view.summary_tokens,
-                view.media_tokens,
-                len(view.final_messages),
-                summary_state.until_ts,
-            )
-        except Exception as exc:
-            logger.debug(f"[Context Manager][debug] runtime view failed: {exc}")
-
-    def _get_compressible_text_messages(
-        self,
-        db_messages: List[Dict[str, Any]],
-        summary_state: SummaryState,
-    ) -> List[Dict[str, Any]]:
-        text_only_db_messages = self._build_text_only_messages(db_messages)
-        text_only_db_messages = self._package_messages(
-            self._prepare_db_messages(text_only_db_messages)
-        )
-
-        pools = self._split_message_pools(
-            text_only_db_messages,
-            summary_state.until_ts,
-            self.valves.keep_start_messages,
-            self.valves.keep_last_messages,
-        )
-
-        # Apply trimming to the compressible messages
-        if pools.compressible:
-            trim_targets = set(range(len(pools.compressible)))
-            trimmed_compressible, _ = self.reconstructor.trim_tool_content(
-                pools.compressible,
-                self.valves.tool_trim_threshold,
-                target_indices=trim_targets,
-            )
-            return trimmed_compressible
-
-        return []
-
-    def _get_chat_id(self, body: dict, metadata: Optional[dict]) -> Optional[str]:
-        if metadata and isinstance(metadata, dict):
-            chat_id = metadata.get("chat_id") or metadata.get("chatId")
-            if chat_id:
-                return str(chat_id)
-
-        if body and isinstance(body, dict):
-            chat_id = body.get("chat_id") or body.get("chatId")
-            if chat_id:
-                return str(chat_id)
-
-            meta = body.get("meta", {})
-            if isinstance(meta, dict):
-                chat_id = meta.get("chat_id") or meta.get("chatId")
-                if chat_id:
-                    return str(chat_id)
-
-        return None
-
-    def _load_db_messages_by_chat_id(self, chat_id: str) -> List[Dict[str, Any]]:
-        if not chat_id or Chats is None:
-            return []
-
-        try:
-            chat_record = Chats.get_chat_by_id(chat_id)
-        except Exception as exc:
-            logger.warning(f"[Chat Load] Failed to fetch chat {chat_id}: {exc}")
-            return []
-
-        chat_payload = getattr(chat_record, "chat", None)
-        if not isinstance(chat_payload, dict):
-            return []
-
-        direct_messages = chat_payload.get("messages")
-        if isinstance(direct_messages, list) and direct_messages:
-            return self._unfold_messages(deepcopy(direct_messages))
-
-        history = chat_payload.get("history")
-        if not isinstance(history, dict):
-            return []
-
-        history_messages = history.get("messages")
-        if not isinstance(history_messages, dict) or not history_messages:
-            return []
-
-        current_id = history.get("currentId") or history.get("current_id")
-
-        return self._unfold_messages(
-            self._reconstruct_active_history_branch(history_messages, current_id)
-        )
-
-    def _reconstruct_active_history_branch(
-        self, history_messages: Any, current_id: Optional[str]
-    ) -> List[Dict[str, Any]]:
-        if not isinstance(history_messages, dict) or not history_messages:
-            return []
-
-        if isinstance(current_id, str) and current_id in history_messages:
-            ordered_messages: List[Dict[str, Any]] = []
-            visited = set()
-            cursor = current_id
-
-            while isinstance(cursor, str) and cursor and cursor not in visited:
-                visited.add(cursor)
-                node = history_messages.get(cursor)
-                if not isinstance(node, dict):
-                    break
-                ordered_messages.append(deepcopy(node))
-                cursor = node.get("parentId") or node.get("parent_id")
-
-            if ordered_messages:
-                ordered_messages.reverse()
-                return ordered_messages
-
-        sortable_messages = []
-        for index, node in enumerate(history_messages.values()):
-            if not isinstance(node, dict):
-                continue
-            timestamp = self._timestamp_of(node)
-            if timestamp is None:
-                timestamp = index
-            sortable_messages.append((float(timestamp), index, deepcopy(node)))
-
-        sortable_messages.sort(key=lambda item: (item[0], item[1]))
-        return [message for _, _, message in sortable_messages]
 
     async def inlet(
         self,
@@ -1190,30 +1310,18 @@ class Filter:
         __event_emitter__: Callable = None,
         __event_call__: Callable = None,
         __request__: Request = None,
+        __model__: dict = None,
     ) -> dict:
-        chat_id = self._get_chat_id(body, __metadata__)
-        if not chat_id:
+        if not (chat_id := self._get_chat_id(body, __metadata__)):
             return body
+        state = await self._get_summary_state(chat_id)
+        db_msgs = await self._load_chat_messages(chat_id)
+        aligned = self._align_messages(db_msgs, body.get("messages", []))
 
-        summary_state = self._get_summary_state(chat_id)
-        db_messages = self._load_chat_messages(chat_id)
-        media_messages = self._extract_media_messages_from_body(body)
-
-        view = self._build_runtime_view(
-            db_messages,
-            media_messages,
-            summary_state,
-        )
+        view = await self._build_runtime_view(aligned, state, __model__)
 
         body["messages"] = view.final_messages
-        self._debug_runtime_view(chat_id, "inlet", view, summary_state)
-
-        await self._emit_status(
-            __event_emitter__,
-            f"💭{view.stats_message}",
-            done=True,
-        )
-
+        await self._emit_status(__event_emitter__, f"💭{view.stats_message}")
         return body
 
     async def outlet(
@@ -1224,290 +1332,171 @@ class Filter:
         __event_emitter__: Callable = None,
         __event_call__: Callable = None,
         __request__: Request = None,
+        __model__: dict = None,
     ) -> dict:
-        chat_id = self._get_chat_id(body, __metadata__)
-        if not chat_id:
+        if not (chat_id := self._get_chat_id(body, __metadata__)):
             return body
+        state = await self._get_summary_state(chat_id)
+        db_msgs = await self._load_chat_messages(chat_id)
+        aligned = self._align_messages(db_msgs, body.get("messages", []))
 
-        summary_state = self._get_summary_state(chat_id)
-        db_messages = self._load_chat_messages(chat_id)
+        view = await self._build_runtime_view(aligned, state, __model__)
 
-        # inject assistant message as it has yet to be written to DB
-        db_messages.append(body["messages"][-1])
-        media_messages = self._extract_media_messages_from_body(body)
-
-        view = self._build_runtime_view(
-            db_messages,
-            media_messages,
-            summary_state,
-        )
-
-        compressible_text_messages = self._get_compressible_text_messages(
-            db_messages, summary_state
-        )
-
-        # Count the actual tokens sitting uncompressed in the DB
-        db_uncompressed_tokens = self._count_tokens_in_messages(
-            compressible_text_messages
-        )
-
-        # Calculate effective tokens for the trigger ---
-        trigger_tokens = db_uncompressed_tokens
-        if self.valves.include_protected_in_threshold:
-            trigger_tokens += view.protected_tokens
-
-        self._debug_runtime_view(chat_id, "outlet-before", view, summary_state)
-
-        # Trigger based on the calculated trigger_tokens
-        if (
-            trigger_tokens > self.valves.compression_threshold_tokens
-            and compressible_text_messages
-        ):
-            await self._emit_status(
-                __event_emitter__,
-                f"Summarizing {db_uncompressed_tokens:,} new tokens...",
-                done=False,
+        text_msgs = []
+        for m in aligned:
+            text_msg = {
+                "role": m.get("role", "user"),
+                "content": TokenCounter.extract_text(m.get("content", "")),
+            }
+            text_msg.update(
+                {k: m[k] for k in ("timestamp", "created_at", "id") if k in m}
             )
-
+            if text_msg["content"]:
+                text_msgs.append(text_msg)
+        pools = self._split_message_pools(
+            text_msgs,
+            state.until_ts,
+            self.valves.keep_start_messages,
+            self.valves.keep_last_messages,
+        )
+        comp_text = (
+            self.reconstructor.trim_tool_content(
+                pools.compressible, self.valves.tool_trim_threshold
+            )[0]
+            if pools.compressible
+            else []
+        )
+        db_u_tok = sum(TokenCounter.count(m) for m in comp_text)
+        trigger = db_u_tok + (
+            view.protected_tokens if self.valves.include_protected_in_threshold else 0
+        )
+        if trigger > self.valves.compression_threshold_tokens and comp_text:
+            await self._emit_status(
+                __event_emitter__, f"Summarizing {db_u_tok:,} new tokens...", False
+            )
             lock = self._lock_for(chat_id)
             if not lock.locked():
-                await self._background_compress(
-                    lock=lock,
-                    chat_id=chat_id,
-                    old_summary_content=summary_state.content,
-                    compressible_messages=compressible_text_messages,
-                    model_id=self.valves.summary_model or body.get("model"),
-                    user_data=__user__,
-                    emitter=__event_emitter__,
-                    request=__request__,
+                # Fire off the summary task into the background and DO NOT wait for it!
+                asyncio.create_task(
+                    self._background_compress(
+                        lock,
+                        chat_id,
+                        state.content,
+                        comp_text,
+                        self.valves.summary_model or body.get("model"),
+                        __user__,
+                        __event_emitter__,
+                        __request__,
+                    )
                 )
-
-                summary_state = self._get_summary_state(chat_id)
-                view = self._build_runtime_view(
-                    db_messages,
-                    media_messages,
-                    summary_state,
-                )
-                self._debug_runtime_view(chat_id, "outlet-after", view, summary_state)
-
-        await self._emit_status(
-            __event_emitter__,
-            f"☑️{view.stats_message}",
-            done=True,
-        )
-
+        await self._emit_status(__event_emitter__, f"☑️{view.stats_message}")
         return body
 
     async def _background_compress(
         self,
         lock: asyncio.Lock,
         chat_id: str,
-        old_summary_content: str,
-        compressible_messages: List[Dict[str, Any]],
-        model_id: Optional[str],
-        user_data: Optional[dict],
-        emitter: Optional[Callable],
-        request: Optional[Request],
+        old_summary: str,
+        msgs: List[Dict[str, Any]],
+        model_id: str,
+        user_data: dict,
+        emitter: Callable,
+        request: Request,
     ):
         async with lock:
             try:
-                if not model_id:
-                    await self._emit_status(emitter, "⚠️ Summary failed: missing model")
+                if not model_id or not msgs:
                     return
-
-                if not compressible_messages:
-                    return
-
-                # --- NEW: Summarizer Circuit Breaker (Chunking) ---
-                # Reserve 6k tokens for the system prompt and the generated output
                 budget = max(10000, self.valves.max_context_tokens - 6000)
-
-                batch_to_compress = []
-                current_tokens = 0
-                pool_text = ""
-
-                for m in compressible_messages:
-                    msg_text = (
-                        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-                    )
-                    msg_tokens = TokenCounter.count(msg_text)
-
-                    if current_tokens + msg_tokens > budget:
-                        if not batch_to_compress:
-                            # Edge Case: The very first message is larger than the entire budget!
-                            # We MUST process it to unblock the queue, so we truncate the text.
-                            # 1 token ~= 4 chars roughly.
-                            allowed_chars = budget * 3
-                            pool_text = (
-                                msg_text[:allowed_chars]
-                                + "\n...[CONTENT TRUNCATED FOR SUMMARY]..."
-                            )
-                            batch_to_compress = [m]
-                            logger.warning(
-                                f"[Context Manager] Single message exceeded budget ({msg_tokens} > {budget}). Truncating for summary."
-                            )
-                        else:
-                            logger.info(
-                                f"[Context Manager] Chunking summary: taking {len(batch_to_compress)} of {len(compressible_messages)} messages to stay under {budget} tokens."
-                            )
-                        break  # Stop adding messages to this batch
-
-                    batch_to_compress.append(m)
-                    current_tokens += msg_tokens
-
-                if not batch_to_compress:
-                    return
-
-                # If we didn't hit the massive single-message edge case, build the text normally
-                if not pool_text:
-                    pool_text = "\n".join(
-                        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-                        for m in batch_to_compress
-                        if m.get("content")
-                    ).strip()
-
-                if not pool_text:
-                    return
-                # --------------------------------------------------
-
-                prompt = f"""
-You are the "Context Architect". Update the conversation archive using the new events. Replace the old archive entirely.
-
+                batch, cur_tok = [], 0
+                for m in msgs:
+                    txt = f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    tok = TokenCounter.count(txt)
+                    if cur_tok + tok > budget:
+                        if not batch:
+                            batch = [m]
+                        break
+                    batch.append(m)
+                    cur_tok += tok
+                pool_txt = "\n".join(
+                    f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    for m in batch
+                ).strip()
+                prompt = f"""You are the "Context Architect". Update the conversation archive using the new events. Replace the old archive entirely.
 ### STRUCTURE (Keep exact order. Include all headers even if empty)
 ## Current State
-Active facts, preferences, and state. Include confidence %:
-- 90-100%: Verified/Implemented
-- 70-89%: Strongly implied
+Active facts, preferences, project constraints, and state. Include confidence %:
+- 90-100%: Verified/Implemented/Purchased
+- 70-89%: Strongly implied/Planned
 - 50-69%: Tentative/Discussed
 - <50%: Omit entirely
-
 ## Decisions
-What was chosen and why. Replace superseded decisions.
-
+What was chosen and why (e.g., architecture, purchases, methodologies). Replace superseded decisions.
 ## Resolutions
-Resolved problems/errors. Remove obsolete ones.
-
-## Final Code/Config
-Verbatim final code, commands, or text. Replace older versions. If none, omit section.
-
+Resolved problems, fixed errors, or completed tasks. Remove obsolete ones.
+## Working States & Code
+Preserve VERBATIM code blocks, configurations, terminal commands, and finalized lists. 
+- Code: DO NOT summarize working code. Keep the exact syntax and language fences. Replace older versions with the latest working state.
+- General: Track the latest working state of architectures, itineraries, or configurations.
+If none, omit section.
 ## Open Items
-Pending actions/questions. Remove when resolved.
-
+Pending actions, blockers, or unanswered questions. Remove when resolved.
 ### RULES
 1. PRECEDENCE: New events overwrite the old archive.
 2. NO HALLUCINATION: Only use provided text.
 3. CONCISE: Bullet points only. Strip filler.
-4. TERMINOLOGY: Preserve user's exact terms.
+4. TERMINOLOGY: Preserve user's exact terms (e.g., specific brand names, technical jargon).
 5. OMIT: Small talk, greetings, AI meta-talk.
 6. FORMAT: Do not wrap the entire response in markdown fences. Start directly with "## Current State".
-
 ### CURRENT ARCHIVE:
-{old_summary_content or "No existing archive."}
-
+{old_summary or "No existing archive."}
 ### NEW EVENTS:
-{pool_text}
-
+{pool_txt}
 ### OUTPUT:
-Provide ONLY the updated archive text. Start directly with "## Current State".
-"""
-                user = None
-                if user_data and user_data.get("id"):
-                    user = await asyncio.to_thread(
-                        Users.get_user_by_id, user_data.get("id")
-                    )
+Provide ONLY the updated archive text. Start directly with "## Current State"."""
 
-                if user is None:
-                    await self._emit_status(
-                        emitter, "⚠️ Summary failed: missing user context"
-                    )
+                user = (
+                    await Users.get_user_by_id(user_data["id"])
+                    if user_data and user_data.get("id")
+                    else None
+                )
+
+                if not user:
                     return
-
-                payload = {
-                    "model": model_id,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "temperature": 0,
-                }
-
-                active_request = request or Request(scope={"type": "http"})
-                response = await generate_chat_completion(active_request, payload, user)
-
-                if hasattr(response, "body"):
-                    response = json.loads(response.body.decode())
-
-                if not (
-                    response and isinstance(response, dict) and response.get("choices")
-                ):
-                    await self._emit_status(
-                        emitter, "⚠️ Summary failed: invalid model response"
-                    )
-                    return
-
-                new_summary_content = response["choices"][0]["message"][
-                    "content"
-                ].strip()
-
-                if not new_summary_content:
-                    await self._emit_status(emitter, "⚠️ Summary failed: empty summary")
-                    return
-
-                # --- NEW: Only use timestamps from the batch we actually compressed ---
-                valid_ts = [self._timestamp_of(m) for m in batch_to_compress]
-                valid_ts = [ts for ts in valid_ts if ts is not None]
+                res = await generate_chat_completion(
+                    request or Request(scope={"type": "http"}),
+                    {
+                        "model": model_id,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                        "temperature": 0,
+                    },
+                    user,
+                )
+                res = json.loads(res.body.decode()) if hasattr(res, "body") else res
+                new_sum = res["choices"][0]["message"]["content"].strip()
+                valid_ts = [
+                    ts for m in batch if (ts := self._timestamp_of(m)) is not None
+                ]
                 until_ts = (
                     max(valid_ts)
                     if valid_ts
                     else int(datetime.now(timezone.utc).timestamp())
                 )
-                # ----------------------------------------------------------------------
-
-                store = _get_store()
-                if store is None:
+                if await _get_store().save(chat_id, new_sum, until_ts):
+                    eff = (
+                        max(
+                            0.0,
+                            min(
+                                100.0,
+                                (1.0 - (TokenCounter.count(new_sum) / cur_tok)) * 100.0,
+                            ),
+                        )
+                        if cur_tok > 0
+                        else 0
+                    )
                     await self._emit_status(
-                        emitter, "⚠️ Summary failed: storage not available"
+                        emitter, f"💾 Summary saved! {eff:.2f}% efficiency"
                     )
-                    return
-
-                saved = store.save(
-                    chat_id=chat_id,
-                    content=new_summary_content,
-                    until_timestamp=until_ts,
-                )
-
-                if not saved:
-                    await self._emit_status(
-                        emitter, "⚠️ Summary generated but save failed"
-                    )
-                    return
-
-                # Stats based on the batch
-                pool_tokens = sum(TokenCounter.count(m) for m in batch_to_compress)
-                summary_tokens = TokenCounter.count(new_summary_content)
-
-                efficiency = None
-                if pool_tokens > 0:
-                    efficiency = max(
-                        0.0, min(100.0, (1.0 - (summary_tokens / pool_tokens)) * 100.0)
-                    )
-
-                eff_str = (
-                    f" {efficiency:.2f}% efficiency" if efficiency is not None else ""
-                )
-
-                # If we chunked, let the user know there is more to go
-                chunk_str = (
-                    f" (Chunk {len(batch_to_compress)}/{len(compressible_messages)})"
-                    if len(batch_to_compress) < len(compressible_messages)
-                    else ""
-                )
-
-                await self._emit_status(
-                    emitter, f"💾 Summary saved!{eff_str}{chunk_str}"
-                )
-
             except Exception as e:
-                logger.error(
-                    f"[Context Manager] Background compression failed: {e}",
-                    exc_info=True,
-                )
                 await self._emit_status(emitter, f"⚠️ Summary failed: {str(e)[:80]}")
