@@ -1,9 +1,9 @@
 """
 title: Context Manager
 id: context_manager
-author: jndao
+author: jndao (Refactored)
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
-version: 0.3.0
+version: 0.3.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -23,56 +23,44 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Callable, Set, Tuple
+
 from fastapi.requests import Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+
+# OpenWebUI Internal Imports
 from open_webui.models.users import Users
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.models.chats import Chats
 from open_webui.internal.db import get_async_db_context
-from sqlalchemy import select
 
 try:
     from open_webui.models.files import Files
 except ImportError:
     Files = None
+
 try:
     import tiktoken
 
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except ImportError:
     ENCODING = None
+
 try:
     from open_webui.internal.db import Base as owui_Base
     from sqlalchemy import Column, Integer, String, Text, DateTime
 except ImportError:
     owui_Base = None
     Column = Integer = String = Text = DateTime = None
+
 try:
     from PIL import Image
 
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
-try:
-    from rapidocr_onnxruntime import RapidOCR
-
-    RAPIDOCR_AVAILABLE = True
-except ImportError:
-    RAPIDOCR_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-
-# Lazy load OCR engine to prevent cold-start CPU spikes
-_ocr_engine = None
-
-
-def get_ocr_engine():
-    global _ocr_engine
-    if _ocr_engine is None and RAPIDOCR_AVAILABLE:
-        logger.info("Initializing RapidOCR engine for the first time...")
-        _ocr_engine = RapidOCR()
-    return _ocr_engine
-
 
 SUMMARY_TAG = "context_summary"
 SUMMARY_SOURCE = "context_manager"
@@ -133,43 +121,14 @@ def calculate_base64_size(base64_data: str) -> int:
     return (len(clean_data) * 3) // 4 - clean_data.count("=")
 
 
-# Simple async cache for files and OCR
+# Simple async cache for files
 _file_b64_cache = {}
-_ocr_desc_cache = {}
-
-
-async def get_cached_ocr_description(file_id: str) -> str:
-    """
-    Performs OCR and caches the result based on the immutable File ID.
-    This avoids hashing massive base64 strings.
-    """
-    if file_id in _ocr_desc_cache:
-        return _ocr_desc_cache[file_id]
-
-    b64_uri = await get_file_base64(file_id)
-    if not b64_uri:
-        res = "[Image content not available]"
-        _ocr_desc_cache[file_id] = res
-        return res
-
-    # Extract the raw b64 part from the data URI
-    _, _, raw_url = extract_base64_data(b64_uri)
-    b64_data, _, _ = extract_base64_data(raw_url)
-
-    if text := extract_text_from_image(b64_data):
-        res = f"[OCR Text]: {text}"
-    else:
-        res = "[Image content available but no text detected]"
-
-    _ocr_desc_cache[file_id] = res
-    return res
 
 
 async def get_file_base64(file_id: str) -> Optional[str]:
     """
     Fetches file from DB, reads from disk, and caches the base64 string.
-    Files are assumed to be immutable after upload to OWUI thus making caching
-    deterministic.
+    Files are assumed to be immutable after upload to OWUI.
     """
     if not file_id or Files is None:
         return None
@@ -178,21 +137,22 @@ async def get_file_base64(file_id: str) -> Optional[str]:
 
     try:
         file_record = await Files.get_file_by_id(file_id)
-        if not file_record or not file_record.path:
+        if (
+            not file_record
+            or not file_record.path
+            or not os.path.exists(file_record.path)
+        ):
             return None
-        if not os.path.exists(file_record.path):
-            return None
-        # 1. Get the real mime type from the DB metadata, fallback to filename extension
+
         mime_type = None
         if file_record.meta and isinstance(file_record.meta, dict):
             mime_type = file_record.meta.get("content_type")
         if not mime_type and file_record.filename:
             mime_type, _ = mimetypes.guess_type(file_record.filename)
-        # 2. If it's STILL unknown, or explicitly NOT an image, abort.
+
         if not mime_type or not mime_type.startswith("image/"):
             return None
 
-        # Read file in a thread to avoid blocking the event loop
         def read_file():
             with open(file_record.path, "rb") as f:
                 return f.read()
@@ -224,34 +184,6 @@ def model_supports_vision(model: Optional[Dict[str, Any]]) -> bool:
         .get("capabilities", {})
         .get("vision", True)
     )
-
-
-def extract_text_from_image(base64_data: str) -> Optional[str]:
-    if not RAPIDOCR_AVAILABLE:
-        return None
-    engine = get_ocr_engine()
-    if engine is None:
-        return None
-    try:
-        # Extract data from URI if present
-        if "base64," in base64_data:
-            base64_data = base64_data.split("base64,")[1]
-
-        result, _ = engine(base64.b64decode(base64_data))
-        if not result:
-            return None
-        return " ".join(
-            [line[1] for line in result if len(line) >= 2 and line[1]]
-        ).strip()
-    except Exception:
-        return None
-
-
-def generate_smart_image_description(base64_data: str, use_ocr: bool = True) -> str:
-    if use_ocr and RAPIDOCR_AVAILABLE:
-        if ocr_text := extract_text_from_image(base64_data):
-            return f"[OCR Text]: {ocr_text}"
-    return "[Image content not available - could not extract description]"
 
 
 def estimate_image_tokens_from_dimensions(
@@ -301,6 +233,7 @@ class ImageCompressor:
         compressed_data = self._compress_at_quality(
             processed_image, target_format, quality
         )
+
         stats = {
             "original_size": original_size,
             "compressed_size": len(compressed_data),
@@ -358,7 +291,7 @@ class ImageCompressor:
 
 
 # =============================================================================
-# CONTEXT MANAGER CORE
+# CONTEXT MANAGER CORE & DB
 # =============================================================================
 def _discover_owui_schema() -> Optional[str]:
     try:
@@ -374,6 +307,7 @@ def _discover_owui_schema() -> Optional[str]:
 
 
 _owui_schema = _discover_owui_schema()
+
 if owui_Base is not None and Column is not None:
 
     class ChatManifest(owui_Base):
@@ -383,6 +317,7 @@ if owui_Base is not None and Column is not None:
             if _owui_schema
             else {"extend_existing": True}
         )
+
         id = Column(Integer, primary_key=True, autoincrement=True)
         chat_id = Column(String(255), unique=True, nullable=False)
         summary_content = Column(Text, nullable=False)
@@ -457,7 +392,6 @@ class SummaryStore:
             if ChatManifest is None:
                 raise RuntimeError("DB dependencies unavailable")
             async with get_async_db_context() as db:
-                # SQLAlchemy 2.0 async table creation
                 conn = await db.connection()
                 await conn.run_sync(ChatManifest.__table__.create, checkfirst=True)
                 await db.commit()
@@ -572,6 +506,7 @@ class TokenCounter:
                     )
                 elif isinstance(part, str):
                     total += TokenCounter._count_text(part)
+
         for tc in (
             msg.get("tool_calls", []) if isinstance(msg.get("tool_calls"), list) else []
         ):
@@ -584,6 +519,7 @@ class TokenCounter:
                 total += TokenCounter._count_text(
                     func.get("name", "")
                 ) + TokenCounter._count_text(func.get("arguments", ""))
+
         total += TokenCounter._count_text(
             msg.get("tool_call_id", "")
         ) + TokenCounter._count_text(msg.get("name", ""))
@@ -605,9 +541,11 @@ class TokenCounter:
             for p in content:
                 if isinstance(p, str):
                     parts.append(p)
-                elif isinstance(p, dict):
-                    if str(p.get("type", "")).strip().lower() in {"text", "input_text"}:
-                        parts.append(str(p.get("text") or p.get("content") or ""))
+                elif isinstance(p, dict) and str(p.get("type", "")).strip().lower() in {
+                    "text",
+                    "input_text",
+                }:
+                    parts.append(str(p.get("text") or p.get("content") or ""))
             return " ".join(parts).strip()
         return ""
 
@@ -626,6 +564,7 @@ class ContextReconstructor:
         trimmed = [deepcopy(msg) for msg in messages]
         stats = {"trimmed_count": 0}
         collapsed = self.collapsed_tool_text()
+
         for i, msg in enumerate(trimmed):
             if target_indices is not None and i not in target_indices:
                 continue
@@ -638,6 +577,7 @@ class ContextReconstructor:
             ):
                 msg["content"] = collapsed
                 stats["trimmed_count"] += 1
+
             for tc in (
                 msg.get("tool_calls", [])
                 if isinstance(msg.get("tool_calls"), list)
@@ -652,6 +592,7 @@ class ContextReconstructor:
                     ):
                         func["arguments"] = collapsed
                         stats["trimmed_count"] += 1
+
             if (
                 isinstance(content := msg.get("content"), str)
                 and '<details type="tool_calls"' in content
@@ -669,6 +610,7 @@ class ContextReconstructor:
                     return block
 
                 msg["content"] = TOOL_DETAILS_BLOCK_RE.sub(_replace, content)
+
         return trimmed, stats
 
 
@@ -712,6 +654,8 @@ class Filter:
         debug_logging: bool = Field(
             default=False, description="Enable detailed console logging."
         )
+
+        # Image Compression Settings
         enable_image_compression: bool = Field(
             default=False, description="Opt-in to native semantic image compression."
         )
@@ -752,10 +696,6 @@ class Filter:
         drop_images_for_non_vision: bool = Field(
             default=True, description="Drop images if the model doesn't support vision."
         )
-        enable_smart_drop: bool = Field(
-            default=True, description="Generate OCR descriptions for dropped images."
-        )
-        use_ocr: bool = Field(default=True, description="Use RapidOCR to extract text.")
         image_token_detail: str = Field(
             default="auto", description="Token estimation detail level (auto/low/high)."
         )
@@ -789,15 +729,14 @@ class Filter:
                 pass
 
     def _get_chat_id(self, body: dict, metadata: dict) -> Optional[str]:
+        meta = metadata or {}
         return (
-            (metadata or {}).get("chat_id")
+            meta.get("chat_id")
             or body.get("chat_id")
             or body.get("meta", {}).get("chat_id")
         )
 
     def _timestamp_of(self, msg: Dict[str, Any]) -> Optional[int]:
-        if not isinstance(msg, dict):
-            return None
         val = msg.get("timestamp") or msg.get("created_at")
         try:
             if isinstance(val, (int, float)):
@@ -811,7 +750,7 @@ class Filter:
         return None
 
     def _unfold_messages(self, messages: Any) -> List[Dict[str, Any]]:
-        if not messages:
+        if not messages or not isinstance(messages, list):
             return []
         result = []
         for msg in messages:
@@ -832,50 +771,60 @@ class Filter:
         return result
 
     async def _scrub_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
-        scrubbed = {
-            k: v
-            for k, v in msg.items()
-            if k in {"id", "parentId", "role", "content", "timestamp"}
-        }
-        if not isinstance(scrubbed.get("content"), str):
-            return scrubbed
+        """Safely extracts and rebuilds message content, fetching images from disk if needed."""
+        if not isinstance(msg, dict):
+            return {"role": "user", "content": ""}
+
+        scrubbed = {"role": msg.get("role", "user"), "content": msg.get("content", "")}
+
+        # Keep essential metadata
+        for k in ["id", "parentId", "timestamp", "created_at"]:
+            if k in msg:
+                scrubbed[k] = msg[k]
+
         files, images = msg.get("files", []), msg.get("images", [])
         if not files and not images:
             return scrubbed
+
         new_content = (
             [{"type": "text", "text": scrubbed["content"]}]
             if scrubbed["content"]
             else []
         )
+
         for f in files:
             if not isinstance(f, dict):
                 continue
             file_id = f.get("id")
             url = f.get("url")
-            # Fetch base64 directly from disk if possible!
+
             b64_url = await get_file_base64(file_id) if file_id else None
             if b64_url:
                 url = b64_url
             elif not url and file_id:
                 url = f"/api/v1/files/{file_id}/content"
+
             if not url:
                 continue
+
             if (
                 f.get("type") == "image"
                 or "image/" in f.get("meta", {}).get("content_type", "")
                 or url.startswith("data:image/")
             ):
                 new_content.append({"type": "image_url", "image_url": {"url": url}})
+
         for img in images:
             if isinstance(img, str):
-                # If it's a file ID, fetch from disk
                 if not img.startswith("data:") and not img.startswith("http"):
                     b64_url = await get_file_base64(img)
                     if b64_url:
                         img = b64_url
                 new_content.append({"type": "image_url", "image_url": {"url": img}})
+
         if len(new_content) > (1 if scrubbed["content"] else 0):
             scrubbed["content"] = new_content
+
         return scrubbed
 
     async def _load_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
@@ -885,12 +834,15 @@ class Filter:
             chat_record = await Chats.get_chat_by_id(chat_id)
         except Exception:
             return []
+
         chat_payload = getattr(chat_record, "chat", {})
         if not isinstance(chat_payload, dict):
             return []
+
         history = chat_payload.get("history", {})
         history_msgs = history.get("messages", {})
         current_id = history.get("currentId") or history.get("current_id")
+
         if isinstance(current_id, str) and current_id in history_msgs:
             ordered, cursor, visited = [], current_id, set()
             while isinstance(cursor, str) and cursor and cursor not in visited:
@@ -937,9 +889,11 @@ class Filter:
         start_cut = min(max(keep_start, 0), total)
         end_count = min(max(keep_end, 0), max(0, total - start_cut))
         end_start = total - end_count
+
         protected_start = list(messages[:start_cut])
         protected_end = list(messages[end_start:]) if end_count > 0 else []
         middle = list(messages[start_cut:end_start])
+
         summarized, compressible = [], []
         for msg in middle:
             ts = self._timestamp_of(msg)
@@ -968,27 +922,32 @@ class Filter:
         aligned = []
         # 1. System prompts from frontend
         for b in body_msgs:
-            if b.get("role") == "system":
+            if isinstance(b, dict) and b.get("role") == "system":
                 aligned.append(deepcopy(b))
-        # 2. DB messages (now with base64 injected from disk!)
+
+        # 2. DB messages
         for d in db_msgs:
-            aligned.append(deepcopy(d))
+            if isinstance(d, dict):
+                aligned.append(deepcopy(d))
+
         if not body_msgs:
             return aligned
+
         # 3. Append the final user/assistant message if it's new
         last_b = body_msgs[-1]
-        if last_b.get("role") != "system":
+        if isinstance(last_b, dict) and last_b.get("role") != "system":
             b_text = TokenCounter.extract_text(last_b.get("content", "")).strip()
             is_new = True
             if aligned:
                 last_aligned = aligned[-1]
-                if last_aligned.get("role") == last_b.get("role"):
+                if isinstance(last_aligned, dict) and last_aligned.get(
+                    "role", "user"
+                ) == last_b.get("role", "user"):
                     a_text = TokenCounter.extract_text(
                         last_aligned.get("content", "")
                     ).strip()
                     if b_text == a_text:
                         is_new = False
-                        # If it's not new, optionally upgrade content if frontend has richer media
                         frontend_content = last_b.get("content")
                         if isinstance(frontend_content, list):
                             has_image = any(
@@ -1031,39 +990,33 @@ class Filter:
     ) -> List[Dict[str, Any]]:
         if not self.valves.enable_image_compression or not pool:
             return pool
+
         processed_pool = []
         for msg in pool:
             if not isinstance(msg, dict) or not msg.get("content"):
                 processed_pool.append(msg)
                 continue
+
             msg_copy = deepcopy(msg)
             content = msg_copy["content"]
+
             if not supports_vision and self.valves.drop_images_for_non_vision:
                 if isinstance(content, list):
                     new_content = []
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "image_url":
-                            text = "[Image dropped - model doesn't support vision]"
-                            if self.valves.enable_smart_drop:
-                                if file_id := part.get("id"):
-                                    text = await get_cached_ocr_description(file_id)
-                                else:
-                                    img_url = part.get("image_url", {})
-                                    url = (
-                                        img_url.get("url", "")
-                                        if isinstance(img_url, dict)
-                                        else str(img_url)
-                                    )
-                                    b64, _, _ = extract_base64_data(url)
-                                    text = generate_smart_image_description(
-                                        b64, self.valves.use_ocr
-                                    )
-                            new_content.append({"type": "text", "text": text})
+                            new_content.append(
+                                {
+                                    "type": "text",
+                                    "text": "[Image dropped - model doesn't support vision]",
+                                }
+                            )
                         else:
                             new_content.append(part)
                     msg_copy["content"] = new_content
                 processed_pool.append(msg_copy)
                 continue
+
             if compressor and PILLOW_AVAILABLE and isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
@@ -1074,6 +1027,7 @@ class Filter:
                             else str(img_url)
                         )
                         b64, fmt, _ = extract_base64_data(url)
+
                         if (
                             b64
                             and calculate_base64_size(b64)
@@ -1088,10 +1042,12 @@ class Filter:
                                     _compress
                                 )
                                 new_url = f"data:{MIME_TYPES.get(new_fmt, 'image/jpeg')};base64,{new_b64}"
+
                                 if isinstance(part["image_url"], dict):
                                     part["image_url"]["url"] = new_url
                                 else:
                                     part["image_url"] = new_url
+
                                 self._image_stats["compressed"] += 1
                                 self._image_stats["saved_bytes"] += (
                                     stats["original_size"] - stats["compressed_size"]
@@ -1156,6 +1112,7 @@ class Filter:
                 max(0, len(aligned_messages) - self.valves.keep_start_messages),
             ),
         )
+
         summarized_media = [
             m
             for p in pools.summarized
@@ -1167,6 +1124,7 @@ class Filter:
             self.valves.tool_trim_threshold,
             set(range(len(pools.compressible))),
         )
+
         protected_start = (
             self.reconstructor.trim_tool_content(
                 pools.protected_start, self.valves.tool_trim_threshold
@@ -1181,6 +1139,7 @@ class Filter:
             if self.valves.trim_protected_messages
             else pools.protected_end
         )
+
         if self.valves.enable_image_compression:
             compressor = (
                 ImageCompressor(
@@ -1196,6 +1155,7 @@ class Filter:
                 if self.valves.enable_vision_detection
                 else True
             )
+
             protected_start = await self._process_pool_images(
                 protected_start,
                 self.valves.image_quality_protected,
@@ -1220,6 +1180,7 @@ class Filter:
                 compressor,
                 supports_vision,
             )
+
         protected_start = [
             {k: v for k, v in m.items() if k != "children"} for m in protected_start
         ]
@@ -1230,6 +1191,7 @@ class Filter:
             {k: v for k, v in m.items() if k != "children"}
             for m in trimmed_compressible
         ]
+
         summary_message = (
             {
                 "role": "system",
@@ -1238,6 +1200,7 @@ class Filter:
             if summary_state.content
             else None
         )
+
         max_tok = self.valves.max_context_tokens
         total_tok = sum(
             TokenCounter.count(m)
@@ -1250,6 +1213,7 @@ class Filter:
             ]
             for m in pool
         )
+
         was_shed = False
         while total_tok > max_tok and max_tok > 0:
             was_shed = True
@@ -1261,6 +1225,7 @@ class Filter:
                 total_tok -= TokenCounter.count(protected_end.pop(0))
             else:
                 break
+
         segments = RuntimeSegments(
             protected_start,
             summary_message,
@@ -1269,17 +1234,20 @@ class Filter:
             protected_end,
         )
         self._calculate_image_tokens(segments.final_messages)
+
         p_tok = sum(TokenCounter.count(m) for m in protected_start + protected_end)
         u_tok = sum(TokenCounter.count(m) for m in uncompressed)
         s_tok = TokenCounter.count(summary_message) if summary_message else 0
         sm_tok = sum(TokenCounter.count(m) for m in summarized_media)
         raw_s_tok = sum(TokenCounter.count(m) for m in pools.summarized)
+
         eff_str = (
             f" @ {round((raw_s_tok - s_tok)/raw_s_tok * 100, 2)}%"
             if raw_s_tok > 0
             else ""
         )
         stats = f"🪙 {format_tokens(p_tok + u_tok + s_tok + sm_tok)} │ 🛡️ {format_tokens(p_tok)} ({len(protected_start)+len(protected_end)}) · ⏳ {format_tokens(u_tok)} ({len(uncompressed)}) · 📦 {format_tokens(s_tok)} ({len(pools.summarized)}{eff_str})"
+
         if was_shed:
             stats = f"⚠️ Limit Reached │ {stats}"
         if self.valves.enable_image_compression and self._image_stats["count"] > 0:
@@ -1291,6 +1259,7 @@ class Filter:
             )
             img_eff = f" @ {round((saved_b / orig_b) * 100)}%" if orig_b > 0 else ""
             stats += f" │ 🖼️ {format_tokens(img_tok)} ({img_cnt}{img_eff})"
+
         return RuntimeView(
             segments.final_messages,
             stats,
@@ -1314,10 +1283,10 @@ class Filter:
     ) -> dict:
         if not (chat_id := self._get_chat_id(body, __metadata__)):
             return body
+
         state = await self._get_summary_state(chat_id)
         db_msgs = await self._load_chat_messages(chat_id)
         aligned = self._align_messages(db_msgs, body.get("messages", []))
-
         view = await self._build_runtime_view(aligned, state, __model__)
 
         body["messages"] = view.final_messages
@@ -1336,10 +1305,10 @@ class Filter:
     ) -> dict:
         if not (chat_id := self._get_chat_id(body, __metadata__)):
             return body
+
         state = await self._get_summary_state(chat_id)
         db_msgs = await self._load_chat_messages(chat_id)
         aligned = self._align_messages(db_msgs, body.get("messages", []))
-
         view = await self._build_runtime_view(aligned, state, __model__)
 
         text_msgs = []
@@ -1353,6 +1322,7 @@ class Filter:
             )
             if text_msg["content"]:
                 text_msgs.append(text_msg)
+
         pools = self._split_message_pools(
             text_msgs,
             state.until_ts,
@@ -1366,17 +1336,18 @@ class Filter:
             if pools.compressible
             else []
         )
+
         db_u_tok = sum(TokenCounter.count(m) for m in comp_text)
         trigger = db_u_tok + (
             view.protected_tokens if self.valves.include_protected_in_threshold else 0
         )
+
         if trigger > self.valves.compression_threshold_tokens and comp_text:
             await self._emit_status(
                 __event_emitter__, f"Summarizing {db_u_tok:,} new tokens...", False
             )
             lock = self._lock_for(chat_id)
             if not lock.locked():
-                # Fire off the summary task into the background and DO NOT wait for it!
                 asyncio.create_task(
                     self._background_compress(
                         lock,
@@ -1389,6 +1360,7 @@ class Filter:
                         __request__,
                     )
                 )
+
         await self._emit_status(__event_emitter__, f"☑️{view.stats_message}")
         return body
 
@@ -1407,10 +1379,13 @@ class Filter:
             try:
                 if not model_id or not msgs:
                     return
+
                 budget = max(10000, self.valves.max_context_tokens - 6000)
                 batch, cur_tok = [], 0
                 for m in msgs:
-                    txt = f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    txt = (
+                        f"{str(m.get('role', 'user')).upper()}: {m.get('content', '')}"
+                    )
                     tok = TokenCounter.count(txt)
                     if cur_tok + tok > budget:
                         if not batch:
@@ -1418,10 +1393,12 @@ class Filter:
                         break
                     batch.append(m)
                     cur_tok += tok
+
                 pool_txt = "\n".join(
-                    f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    f"{str(m.get('role', 'user')).upper()}: {m.get('content', '')}"
                     for m in batch
                 ).strip()
+
                 prompt = f"""You are the "Context Architect". Update the conversation archive using the new events. Replace the old archive entirely.
 ### STRUCTURE (Keep exact order. Include all headers even if empty)
 ## Current State
@@ -1460,9 +1437,9 @@ Provide ONLY the updated archive text. Start directly with "## Current State".""
                     if user_data and user_data.get("id")
                     else None
                 )
-
                 if not user:
                     return
+
                 res = await generate_chat_completion(
                     request or Request(scope={"type": "http"}),
                     {
@@ -1475,6 +1452,7 @@ Provide ONLY the updated archive text. Start directly with "## Current State".""
                 )
                 res = json.loads(res.body.decode()) if hasattr(res, "body") else res
                 new_sum = res["choices"][0]["message"]["content"].strip()
+
                 valid_ts = [
                     ts for m in batch if (ts := self._timestamp_of(m)) is not None
                 ]
@@ -1483,6 +1461,7 @@ Provide ONLY the updated archive text. Start directly with "## Current State".""
                     if valid_ts
                     else int(datetime.now(timezone.utc).timestamp())
                 )
+
                 if await _get_store().save(chat_id, new_sum, until_ts):
                     eff = (
                         max(
