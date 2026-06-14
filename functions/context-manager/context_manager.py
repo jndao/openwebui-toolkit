@@ -1,7 +1,7 @@
 """
 title: Context Manager
 id: context_manager
-author: jndao (Refactored)
+author: jndao
 description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
 version: 0.3.1
 author_url: https://github.com/jndao
