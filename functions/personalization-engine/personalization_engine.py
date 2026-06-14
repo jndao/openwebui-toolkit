@@ -1,28 +1,31 @@
 """
 title: Personalization Engine
 author: jndao
-description: A two-tier memory system that autonomously extracts user observations and synthesizes them into a high-density, structured User Profile.
-version: 0.0.2
+description: A two-tier memory system that autonomously extracts user observations and synthesizes them into a high-density, structured Personalization Context.
+version: 0.0.3-dev.3
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
 license: https://github.com/jndao/openwebui-toolkit/blob/main/LICENSE
+requirements: openwebui>=0.9.0
 """
 
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, TypeVar
 
 from fastapi import Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select, func
 
 from open_webui.models.users import UserModel, Users
 from open_webui.models.memories import Memories
 from open_webui.utils.chat import generate_chat_completion
-from open_webui.internal.db import Base, get_db_context
+from open_webui.internal.db import get_async_db_context
 from sqlalchemy import BigInteger, Column, String, Text
 
 logger = logging.getLogger(__name__)
@@ -65,13 +68,26 @@ class ProfileStore:
     def __init__(self):
         self._initialized = False
 
-    def _ensure_table(self):
+    async def _ensure_table(self):
         if self._initialized:
             return True
         try:
-            with get_db_context() as db:
-                UserProfile.__table__.create(bind=db.bind, checkfirst=True)
-                db.commit()
+            async with get_async_db_context() as db:
+                # Use SQLAlchemy 2.0 async style
+                from sqlalchemy import text
+                # Create table if not exists using raw SQL for compatibility
+                await db.execute(
+                    text(f"""
+                        CREATE TABLE IF NOT EXISTS {f'{_owui_schema}.' if _owui_schema else ''}user_profiles (
+                            id TEXT PRIMARY KEY,
+                            user_id TEXT UNIQUE NOT NULL,
+                            content TEXT NOT NULL,
+                            updated_at INTEGER NOT NULL,
+                            created_at INTEGER NOT NULL
+                        )
+                    """)
+                )
+                await db.commit()
             self._initialized = True
             return True
         except Exception as e:
@@ -80,11 +96,13 @@ class ProfileStore:
             )
             return False
 
-    def get_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
-        self._ensure_table()
+    async def get_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
+        await self._ensure_table()
         try:
-            with get_db_context() as db:
-                record = db.query(UserProfile).filter_by(user_id=user_id).first()
+            async with get_async_db_context() as db:
+                stmt = select(UserProfile).where(UserProfile.user_id == user_id)
+                result = await db.execute(stmt)
+                record = result.scalars().first()
                 if record:
                     return {
                         "id": record.id,
@@ -97,25 +115,27 @@ class ProfileStore:
             logger.error(f"[Personalization Engine] Failed to get profile: {e}")
             return None
 
-    def save_profile(self, user_id: str, content: str) -> bool:
-        self._ensure_table()
+    async def save_profile(self, user_id: str, content: str) -> bool:
+        await self._ensure_table()
         try:
-            with get_db_context() as db:
-                record = db.query(UserProfile).filter_by(user_id=user_id).first()
+            async with get_async_db_context() as db:
+                stmt = select(UserProfile).where(UserProfile.user_id == user_id)
+                result = await db.execute(stmt)
+                record = result.scalars().first()
                 now = int(time.time())
                 if record:
                     record.content = content
                     record.updated_at = now
                 else:
-                    record = UserProfile(
+                    new_record = UserProfile(
                         id=str(uuid.uuid4()),
                         user_id=user_id,
                         content=content,
                         created_at=now,
                         updated_at=now,
                     )
-                    db.add(record)
-                db.commit()
+                    db.add(new_record)
+                await db.commit()
                 return True
         except Exception as e:
             logger.error(f"[Personalization Engine] Failed to save profile: {e}")
@@ -167,15 +187,19 @@ class Filter:
         )
         consolidation_threshold: int = Field(
             default=5,
-            description="Number of engine memories to accumulate before triggering a profile reconsolidation.",
+            description="Number of engine memories to accumulate before triggering a context reconsolidation.",
         )
         max_profile_tokens: int = Field(
-            default=3000,
-            description="Maximum token length of the profile. If exceeded, the engine will aggressively compress older traits during synthesis to save context space.",
+            default=2000,
+            description="Maximum token length of the context. If exceeded, the engine will aggressively compress older traits during synthesis to save space.",
+        )
+        sanitize_code_blocks: bool = Field(
+            default=True,
+            description="Strip code blocks from messages before extraction to save tokens. Highly recommended.",
         )
         emit_status_events: bool = Field(
             default=True,
-            description="Toggle whether users should see UI status events during profile synthesis.",
+            description="Toggle whether users should see UI status events during context synthesis.",
         )
         debug_logging: bool = Field(
             default=False, description="Enable detailed console logging."
@@ -221,6 +245,35 @@ class Filter:
                 "debug",
             )
             return len(text) // 4
+
+    def _sanitize_for_extraction(self, messages: List[Dict]) -> str:
+        """
+        Extracts text from messages, handles multimodal lists,
+        and optionally strips out code blocks to save tokens during extraction.
+        """
+        sanitized_text = []
+
+        for m in messages:
+            role = m.get("role", "user").upper()
+            content = m.get("content", "")
+            text_content = ""
+
+            # 1. Handle Open WebUI's multimodal list format (images/files)
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_content += part.get("text", "") + "\n"
+            elif isinstance(content, str):
+                text_content = content
+
+            # 2. Strip the code blocks if valve is enabled
+            if self.valves.sanitize_code_blocks:
+                pattern = r"[\s\S]+?"
+                text_content = re.sub(pattern, "\n[Code block omitted]\n", text_content)
+
+            sanitized_text.append(f"{role}: {text_content.strip()}")
+
+        return "\n".join(sanitized_text)
 
     async def _emit_status(
         self, emitter: Optional[Callable], message: str, done: bool = True
@@ -287,21 +340,19 @@ class Filter:
         __request__: Optional[Request] = None,
         __event_emitter__: Optional[Callable] = None,
     ) -> dict:
-        """Injects the Profile and any pending memories into the system prompt before the LLM sees it."""
+        """Injects the Context and any pending memories into the system prompt before the LLM sees it."""
         if not __user__ or "messages" not in body:
             return body
         user_id = __user__.get("id")
         if not user_id:
             return body
         try:
-            # Fetch the main profile
-            profile_data = await asyncio.to_thread(_profile_store.get_profile, user_id)
+            # Fetch the main profile (now async)
+            profile_data = await _profile_store.get_profile(user_id)
             profile_text = profile_data.get("content") if profile_data else None
 
-            # Fetch any pending (unprocessed) memories
-            all_memories = await asyncio.to_thread(
-                Memories.get_memories_by_user_id, user_id
-            )
+            # Fetch any pending (unprocessed) memories (now async)
+            all_memories = await Memories.get_memories_by_user_id(user_id)
             pending_memories = [
                 m.content.replace(f"{self.ENGINE_TAG} ", "", 1)
                 for m in all_memories
@@ -309,13 +360,14 @@ class Filter:
             ]
 
             if profile_text or pending_memories:
-                # 1. Explicit framing to prevent AI roleplay
+                # 1. Explicit framing to prevent AI roleplay and mirroring
                 injection = (
-                    "BACKGROUND CONTEXT ABOUT THE HUMAN USER:\n"
-                    "The following information describes the person you are speaking with. "
-                    "You are the AI assistant. DO NOT adopt this profile as your own identity. "
-                    "Use this context strictly to tailor your answers to the user's expertise, preferences, and current state.\n\n"
-                    "<user_profile>\n"
+                    "PERSONALIZATION CONFIGURATION:\n"
+                    "The following parameters define the user's environment, technical stack, and communication preferences. "
+                    "Use this context to tailor your response style and technical depth. "
+                    "DO NOT mention, quote, or reflect this configuration back to the user. "
+                    "Treat this as background system state.\n\n"
+                    "<personalization>\n"
                 )
 
                 if profile_text:
@@ -329,26 +381,26 @@ class Filter:
 
                 # 2. Strong closing reinforcement
                 injection += (
-                    "</user_profile>\n"
-                    "Remember: The profile above describes the user. Adapt your communication style to suit them."
+                    "</personalization>\n"
+                    "Remember: The parameters above describe the operational context. Adapt your communication style accordingly without explicitly referencing these rules."
                 )
 
                 # Insert at the very beginning of the context
                 body["messages"].insert(0, {"role": "system", "content": injection})
 
                 self._log(
-                    f"Injected User Profile and {len(pending_memories)} pending memories for user {user_id}.",
+                    f"Injected Personalization Context and {len(pending_memories)} pending memories for user {user_id}.",
                     "debug",
                 )
                 await self._emit_status(
                     __event_emitter__,
-                    "⚙️ Personalization Engine: Injected User Profile",
+                    "⚙️ Personalization Engine: Injected Context",
                     done=True,
                 )
             else:
                 await self._emit_status(
                     __event_emitter__,
-                    "⚙️ Personalization Engine: No Profile established yet",
+                    "⚙️ Personalization Engine: No Context established yet",
                     done=True,
                 )
         except Exception as e:
@@ -397,7 +449,7 @@ class Filter:
         if len(messages) < 1:
             return
         user_id = user_data["id"]
-        user = await asyncio.to_thread(Users.get_user_by_id, user_id)
+        user = await Users.get_user_by_id(user_id)
         if not user:
             return
         lock = self._lock_for(user_id)
@@ -407,18 +459,14 @@ class Filter:
                 engine_model = self.valves.engine_model or chat_model
 
                 # 1. FETCH FULL CONTEXT (Profile + Pending Memories)
-                profile_data = await asyncio.to_thread(
-                    _profile_store.get_profile, user_id
-                )
+                profile_data = await _profile_store.get_profile(user_id)
                 current_profile_text = (
                     profile_data["content"]
                     if profile_data
-                    else "No profile exists yet."
+                    else "No context exists yet."
                 )
 
-                all_memories = await asyncio.to_thread(
-                    Memories.get_memories_by_user_id, user_id
-                )
+                all_memories = await Memories.get_memories_by_user_id(user_id)
                 if all_memories is None:
                     all_memories = []
 
@@ -435,21 +483,17 @@ class Filter:
                     pending_text = "\n".join([f"- {m}" for m in pending_list])
 
                 # 2. EXTRACTION (Differential)
-                last_messages = "\n".join(
-                    [
-                        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-                        for m in messages[-3:]
-                    ]
-                )
+                # Use the new sanitization method to strip code blocks and handle multimodal lists
+                last_messages = self._sanitize_for_extraction(messages[-3:])
 
                 extractor_system_prompt = (
                     "You are a real-time context observer. Analyze the user's latest message for personal concepts (facts, preferences, emotional states, goals).\n\n"
-                    f"CURRENT USER PROFILE:\n{current_profile_text}\n\n"
+                    f"CURRENT PERSONALIZATION CONTEXT:\n{current_profile_text}\n\n"
                     f"RECENT UNPROCESSED EVENTS:\n{pending_text}\n\n"
                     "INSTRUCTIONS:\n"
-                    "1. Compare the user's message against BOTH the CURRENT USER PROFILE and the RECENT UNPROCESSED EVENTS.\n"
+                    "1. Compare the user's message against BOTH the CURRENT PERSONALIZATION CONTEXT and the RECENT UNPROCESSED EVENTS.\n"
                     "2. ONLY extract observations that are NEW, add SIGNIFICANT DETAIL, or CORRECT existing information about the human user.\n"
-                    "3. Ignore transient statements or things already well-covered in the profile or pending events.\n"
+                    "3. Ignore transient statements or things already well-covered in the context or pending events.\n"
                     "4. Every observation MUST start with 'User...'.\n"
                 )
 
@@ -471,9 +515,7 @@ class Filter:
                     for obs in extraction.observations:
                         # Safely namespace the memory with the ENGINE_TAG
                         tagged_content = f"{self.ENGINE_TAG} {obs.content}"
-                        await asyncio.to_thread(
-                            Memories.insert_new_memory, user_id, tagged_content
-                        )
+                        await Memories.insert_new_memory(user_id, tagged_content)
                         self._log(f"Added engine memory: {obs.content}", "info")
 
                     # Emit exact number of memories saved
@@ -484,9 +526,7 @@ class Filter:
                     )
 
                     # Refresh memories from DB to ensure we have the real IDs for the newly inserted ones
-                    all_memories = await asyncio.to_thread(
-                        Memories.get_memories_by_user_id, user_id
-                    )
+                    all_memories = await Memories.get_memories_by_user_id(user_id)
                     if all_memories is None:
                         all_memories = []
 
@@ -509,7 +549,7 @@ class Filter:
                     )
                     await self._emit_status(
                         emitter,
-                        "🧠 Personalization Engine: Synthesizing Profile...",
+                        "🧠 Personalization Engine: Synthesizing Context...",
                         done=False,
                     )
 
@@ -530,45 +570,50 @@ class Filter:
                     compression_warning = ""
                     if is_bloated:
                         self._log(
-                            f"Profile tokens ({current_tokens}) exceeds maximum ({self.valves.max_profile_tokens}). Triggering Deep Compression.",
+                            f"Context tokens ({current_tokens}) exceeds maximum ({self.valves.max_profile_tokens}). Triggering Deep Compression.",
                             "warning",
                         )
                         compression_warning = (
                             f"\n\n[CRITICAL WARNING: MAXIMUM TOKEN LIMIT REACHED ({current_tokens}/{self.valves.max_profile_tokens})]\n"
-                            "The current profile is too long. You MUST aggressively compress older, related traits into denser abstractions to make room for the new facts. "
-                            "Drop trivial details. DO NOT increase the overall length of the profile. Prioritize core psychological traits and infrastructure details."
+                            "The current context is too long. You MUST aggressively compress older, related traits into denser abstractions to make room for the new facts. "
+                            "Drop trivial details. DO NOT increase the overall length of the context. Prioritize core behavioral parameters and infrastructure details."
                         )
 
                     synth_system_prompt = f"""
-You are the "Identity Synthesizer". Update the master User Profile archive using the newly extracted memory events. Replace the old profile entirely.
+You are the "Personalization Architect". Update the background configuration for this user using the newly extracted memory events. Replace the old configuration entirely.
+
+### THE GOLDEN RULE
+Use TELEGRAPHIC, OBJECTIVE language. 
+- NO narrative prose. 
+- NO conversational filler. 
+- NO subjective labels (e.g., do not call the user "lazy" or a "scientist" unless they used those exact words). 
+- Use technical, clinical descriptions of behavior.
 
 ### STRUCTURE (Keep exact order. Include all headers even if empty)
-## Core Identity & Verified Facts
-Hard data, demographics, and permanent traits. Include confidence %:
-- 90-100%: Verified/Established (e.g., career, family, core tech stack)
-- 70-89%: Strongly implied/Consistent behavior
-- 50-69%: Tentative/Fleeting interests
+## Verified Facts
+(Location, hardware, verified tools, career state)
+- 90-100%: [Fact]
+- 70-89%: [Strong Inference]
+- 50-69%: [Tentative]
 - <50%: Omit entirely
 
-## Operating Principles & Preferences
-How the user makes decisions, their communication style, and UI/UX/formatting preferences. Replace superseded preferences.
+## Behavioral Parameters & Preferences
+(Decision-making logic, communication style, UI/UX requirements. Replace superseded preferences.)
 
-## Active Cognitive Load
-What the user is currently focused on, learning, or building. 
+## Active Projects & Cognitive Load
+(Current focus areas)
 
-## Deprecated Traits & Resolved Goals
-Old habits, abandoned projects, or changed opinions. (Note: Keep this brief; it serves as a tombstone before being purged as required).
+## Deprecated/Resolved
+(Historical context, old habits, finished projects. Keep brief.)
 
 ### RULES
-1. PRECEDENCE: New behavioral events overwrite old profile assumptions.
-2. NO ROLEPLAY: You are analyzing the user. Do not adopt this profile as yourself.
-3. CONCISE: Bullet points only. Strip narrative filler and pleasantries.
-4. TERMINOLOGY: Preserve the user's exact phrasing for their beliefs and tools.
-5. FORMAT: Start directly with "## Core Identity & Verified Facts". No markdown fences.
-
+1. PRECEDENCE: New events overwrite old assumptions.
+2. NO MIRRORING: Do not write the configuration in a way that encourages the AI to quote it back to the user.
+3. CONCISE: Bullet points only.
+4. FORMAT: Start directly with "## Verified Facts". No markdown fences.
 {compression_warning}
 """
-                    user_msg = f"CURRENT USER PROFILE:\n{current_profile_text}\n\nNEW RAW MEMORY FACTS TO MERGE:\n{facts_json}"
+                    user_msg = f"CURRENT PERSONALIZATION CONTEXT:\n{current_profile_text}\n\nNEW RAW MEMORY FACTS TO MERGE:\n{facts_json}"
 
                     consolidation = await self._call_llm_native(
                         request,
@@ -580,18 +625,16 @@ Old habits, abandoned projects, or changed opinions. (Note: Keep this brief; it 
                     )
 
                     if consolidation and consolidation.profile_summary:
-                        success = await asyncio.to_thread(
-                            _profile_store.save_profile,
+                        success = await _profile_store.save_profile(
                             user_id,
                             consolidation.profile_summary,
                         )
                         if success:
-                            self._log("Profile updated successfully.", "info")
+                            self._log("Context updated successfully.", "info")
 
                             # The Purge: Delete the processed batch entirely to keep the memory list clean
                             for m in batch:
-                                await asyncio.to_thread(
-                                    Memories.delete_memory_by_id_and_user_id,
+                                await Memories.delete_memory_by_id_and_user_id(
                                     m.id,
                                     user_id,
                                 )
@@ -599,16 +642,16 @@ Old habits, abandoned projects, or changed opinions. (Note: Keep this brief; it 
                             # Emit exact number of memories incorporated
                             await self._emit_status(
                                 emitter,
-                                f"✨ Personalization Engine: Incorporated {len(batch)} events into Profile!",
+                                f"✨ Personalization Engine: Incorporated {len(batch)} events into Context!",
                                 done=True,
                             )
                         else:
                             await self._emit_status(
-                                emitter, "⚠️ Failed to save Profile.", done=True
+                                emitter, "⚠️ Failed to save Context.", done=True
                             )
                     else:
                         await self._emit_status(
-                            emitter, "⚠️ Profile synthesis failed.", done=True
+                            emitter, "⚠️ Context synthesis failed.", done=True
                         )
 
             except Exception as e:
