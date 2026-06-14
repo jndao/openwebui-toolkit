@@ -2,8 +2,8 @@
 title: Context Manager
 id: context_manager
 author: jndao
-description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native semantic image compression.
-version: 0.3.1
+description: An intelligent context-layer for OpenWebUI that preserves multimodal inputs while maintaining a permanent compressed archive and token efficiency. Includes native dimension-based image optimization.
+version: 0.4.0-dev.1
 author_url: https://github.com/jndao
 repository_url: https://github.com/jndao/openwebui-toolkit
 funding_url: https://ko-fi.com/jndao
@@ -19,6 +19,7 @@ import io
 import os
 import math
 import mimetypes
+from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -67,8 +68,12 @@ SUMMARY_SOURCE = "context_manager"
 TOOL_DETAILS_BLOCK_RE = re.compile(r'<details type="tool_calls"[\s\S]*?</details>')
 TOOL_RESULT_ATTR_RE = re.compile(r'result="([^"]*)"')
 
+# Images smaller than this (decoded bytes) are left untouched to avoid
+# re-opening trivial assets (avatars, icons) on every turn.
+IMG_PROCESS_MIN_BYTES = 65536
+
 # =============================================================================
-# IMAGE COMPRESSION CONSTANTS & HELPERS
+# IMAGE OPTIMIZATION CONSTANTS & HELPERS
 # =============================================================================
 IMAGE_PREFIXES = {
     b"/9j/": "jpeg",
@@ -111,8 +116,14 @@ def extract_base64_data(image_url: str) -> Tuple[Optional[str], Optional[str], s
                 match.group(1).lower().replace("jpg", "jpeg"),
                 image_url,
             )
-    if re.match(r"^[A-Za-z0-9+/=]+$", image_url.strip()):
-        return image_url.strip(), detect_image_format(image_url), image_url
+    # Raw base64 detection: only sniff a prefix instead of scanning the whole
+    # (potentially multi-MB) string. Base64 images are long; short tokens like
+    # file paths ("/api/v1/files/.../content") are excluded by the length gate.
+    stripped = image_url.strip()
+    if len(stripped) > 256:
+        prefix = stripped[:64]
+        if re.match(r"^[A-Za-z0-9+/]+$", prefix):
+            return stripped, detect_image_format(stripped), image_url
     return None, None, image_url
 
 
@@ -121,19 +132,52 @@ def calculate_base64_size(base64_data: str) -> int:
     return (len(clean_data) * 3) // 4 - clean_data.count("=")
 
 
-# Simple async cache for files
-_file_b64_cache = {}
+class _ByteBoundedLRU:
+    """Async-safe LRU cache bounded by total stored bytes (not item count),
+    since cached images vary wildly in size."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._store: "OrderedDict[str, str]" = OrderedDict()
+        self._total = 0
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> Optional[str]:
+        async with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+                return self._store[key]
+            return None
+
+    async def put(self, key: str, value: str) -> None:
+        size = len(value)
+        async with self._lock:
+            if key in self._store:
+                self._total -= len(self._store[key])
+                self._store.move_to_end(key)
+            self._store[key] = value
+            self._total += size
+            # Always keep at least one entry even if it exceeds the cap.
+            while self._total > self.max_bytes and len(self._store) > 1:
+                _, old = self._store.popitem(last=False)
+                self._total -= len(old)
+
+
+# Files are immutable after upload, so caching their base64 is safe.
+_file_b64_cache = _ByteBoundedLRU(max_bytes=256 * 1024 * 1024)
 
 
 async def get_file_base64(file_id: str) -> Optional[str]:
     """
-    Fetches file from DB, reads from disk, and caches the base64 string.
-    Files are assumed to be immutable after upload to OWUI.
+    Fetches file from DB, reads from disk, and caches the base64 string in a
+    byte-bounded LRU.
     """
     if not file_id or Files is None:
         return None
-    if file_id in _file_b64_cache:
-        return _file_b64_cache[file_id]
+
+    cached = await _file_b64_cache.get(file_id)
+    if cached is not None:
+        return cached
 
     try:
         file_record = await Files.get_file_by_id(file_id)
@@ -160,7 +204,7 @@ async def get_file_base64(file_id: str) -> Optional[str]:
         file_bytes = await asyncio.to_thread(read_file)
         b64_data = base64.b64encode(file_bytes).decode("utf-8")
         res = f"data:{mime_type};base64,{b64_data}"
-        _file_b64_cache[file_id] = res
+        await _file_b64_cache.put(file_id, res)
         return res
     except Exception as e:
         logger.debug(f"Failed to load file {file_id} from disk: {e}")
@@ -205,89 +249,116 @@ def estimate_image_tokens_from_dimensions(
     return 85 + 170 * (tiles_w * tiles_h)
 
 
-class ImageCompressor:
-    def __init__(
-        self,
-        max_size_bytes: int,
-        convert_png_to_jpeg: bool,
-        preserve_transparency: bool,
-    ):
-        self.max_size_bytes = max_size_bytes
-        self.convert_png_to_jpeg = convert_png_to_jpeg
-        self.preserve_transparency = preserve_transparency
+class ImageProcessor:
+    """
+    Format-preserving image optimizer.
 
-    def compress_image(
-        self, base64_data: str, original_format: Optional[str], quality: int
+    Two decoupled levers:
+      1. Dimension downscale  -> reduces vision TOKEN cost (tile count).
+      2. Byte cap             -> satisfies provider MAX-MB payload limits.
+
+    Format is never converted (PNG stays PNG, JPEG stays JPEG, WebP stays WebP),
+    so transparency is preserved and no provider-incompatible WebP is introduced.
+    """
+
+    def __init__(self, max_size_bytes: int):
+        self.max_size_bytes = max_size_bytes
+
+    def process(
+        self,
+        base64_data: str,
+        original_format: Optional[str],
+        max_dim: Optional[int],
+        quality: int,
     ) -> Tuple[str, str, Dict[str, Any]]:
         if not PILLOW_AVAILABLE:
             raise RuntimeError("Pillow is not installed.")
+
         image_bytes = base64.b64decode(base64_data)
         original_size = len(image_bytes)
         image = Image.open(io.BytesIO(image_bytes))
-        original_format = original_format or (
-            image.format.lower() if image.format else "png"
-        )
-        has_transparency = image.mode in ("RGBA", "LA", "P")
-        target_format = self._determine_target_format(original_format, has_transparency)
-        processed_image = self._prepare_image_for_save(image, target_format)
-        compressed_data = self._compress_at_quality(
-            processed_image, target_format, quality
-        )
+        fmt = original_format or (image.format.lower() if image.format else "png")
+        if fmt == "jpg":
+            fmt = "jpeg"
 
-        stats = {
+        no_op = {
+            "changed": False,
             "original_size": original_size,
-            "compressed_size": len(compressed_data),
-            "original_format": original_format,
-            "new_format": target_format,
-            "quality": quality,
+            "compressed_size": original_size,
         }
-        return base64.b64encode(compressed_data).decode("utf-8"), target_format, stats
 
-    def _determine_target_format(
-        self, original_format: str, has_transparency: bool
-    ) -> str:
-        if original_format in ("jpeg", "jpg", "webp", "gif"):
-            return original_format
-        if self.convert_png_to_jpeg:
-            return (
-                "webp" if (has_transparency and self.preserve_transparency) else "jpeg"
+        # Only touch formats we can safely re-encode. GIF (possibly animated),
+        # BMP, etc. pass through untouched.
+        if fmt not in ("jpeg", "png", "webp"):
+            return base64_data, fmt, no_op
+
+        resized = False
+        # 1) Dimension downscale (token + byte reduction), format preserved.
+        if max_dim and max(image.size) > max_dim:
+            scale = max_dim / float(max(image.size))
+            image = image.resize(
+                (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                Image.LANCZOS,
             )
-        return original_format
+            resized = True
 
-    def _prepare_image_for_save(
-        self, image: Image.Image, target_format: str
-    ) -> Image.Image:
-        if target_format == "jpeg":
-            if image.mode in ("RGBA", "LA", "P"):
-                background = Image.new("RGB", image.size, (255, 255, 255))
-                if image.mode == "P":
-                    image = image.convert("RGBA")
-                if image.mode in ("RGBA", "LA"):
-                    background.paste(image, mask=image.split()[-1])
-                    return background
-            return image.convert("RGB") if image.mode != "RGB" else image
-        elif target_format == "webp":
-            if image.mode == "P":
-                return image.convert(
-                    "RGBA" if image.info.get("transparency") else "RGB"
-                )
-            if image.mode not in ("RGB", "RGBA", "L"):
-                return image.convert("RGB")
-        return image
+        data = self._encode(image, fmt, quality) if resized else None
+        current_size = len(data) if data is not None else original_size
 
-    def _compress_at_quality(
-        self, image: Image.Image, target_format: str, quality: int
-    ) -> bytes:
-        buffer = io.BytesIO()
-        kwargs = (
-            {"quality": quality, "optimize": True}
-            if target_format in ("jpeg", "webp")
-            else {"optimize": True}
+        # 2) Byte cap (provider payload limits).
+        if self.max_size_bytes and current_size > self.max_size_bytes:
+            if data is None:
+                data = self._encode(image, fmt, quality)
+            data, image = self._enforce_byte_cap(image, fmt, quality, data)
+
+        if data is None:
+            return base64_data, fmt, no_op
+
+        # If we only re-encoded (no resize) and it didn't help, keep the original.
+        if not resized and len(data) >= original_size:
+            return base64_data, fmt, no_op
+
+        return (
+            base64.b64encode(data).decode("utf-8"),
+            fmt,
+            {
+                "changed": True,
+                "original_size": original_size,
+                "compressed_size": len(data),
+            },
         )
-        if target_format == "webp":
-            kwargs["method"] = 4
-        image.save(buffer, format=target_format.upper(), **kwargs)
+
+    def _encode(self, image: "Image.Image", fmt: str, quality: int) -> bytes:
+        buffer = io.BytesIO()
+        if fmt == "jpeg":
+            img = image if image.mode in ("RGB", "L") else image.convert("RGB")
+            img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        elif fmt == "webp":
+            img = image
+            if img.mode not in ("RGB", "RGBA", "L"):
+                img = img.convert("RGBA" if "A" in img.mode else "RGB")
+            img.save(buffer, format="WEBP", quality=quality, method=4)
+        else:  # png — transparency preserved, lossless. No quality knob.
+            image.save(buffer, format="PNG", optimize=True)
         return buffer.getvalue()
+
+    def _enforce_byte_cap(
+        self, image: "Image.Image", fmt: str, quality: int, data: bytes
+    ) -> Tuple[bytes, "Image.Image"]:
+        q = quality
+        # Lossy formats: step quality down first.
+        if fmt in ("jpeg", "webp"):
+            while len(data) > self.max_size_bytes and q > 20:
+                q = max(20, q - 15)
+                data = self._encode(image, fmt, q)
+        # Still over (or PNG, which has no quality knob): downscale iteratively.
+        while len(data) > self.max_size_bytes and max(image.size) > 256:
+            image = image.resize(
+                (max(1, int(image.width * 0.8)), max(1, int(image.height * 0.8))),
+                Image.LANCZOS,
+            )
+            data = self._encode(image, fmt, q)
+        return data, image
 
 
 # =============================================================================
@@ -655,40 +726,48 @@ class Filter:
             default=False, description="Enable detailed console logging."
         )
 
-        # Image Compression Settings
+        # Image Optimization Settings
         enable_image_compression: bool = Field(
-            default=False, description="Opt-in to native semantic image compression."
+            default=False,
+            description="Opt-in to native image optimization (dimension downscaling + byte cap).",
+        )
+        image_max_dim_protected: int = Field(
+            default=2048,
+            ge=64,
+            description="Max pixel dimension for images in protected zones (High Fidelity).",
+        )
+        image_max_dim_uncompressed: int = Field(
+            default=1024,
+            ge=64,
+            description="Max pixel dimension for images in the uncompressed zone (Medium Fidelity).",
+        )
+        image_max_dim_summarized: int = Field(
+            default=768,
+            ge=64,
+            description="Max pixel dimension for images in the summarized zone (Low Fidelity).",
         )
         image_quality_protected: int = Field(
             default=85,
             ge=1,
             le=100,
-            description="Quality for images in protected zones (High Fidelity).",
+            description="JPEG/WebP quality used when byte-capping protected-zone images.",
         )
         image_quality_uncompressed: int = Field(
             default=60,
             ge=1,
             le=100,
-            description="Quality for images in uncompressed zone (Medium Fidelity).",
+            description="JPEG/WebP quality used when byte-capping uncompressed-zone images.",
         )
         image_quality_summarized: int = Field(
-            default=20,
+            default=40,
             ge=1,
             le=100,
-            description="Quality for images in summarized zone (Low Fidelity).",
+            description="JPEG/WebP quality used when byte-capping summarized-zone images.",
         )
         max_image_size_bytes: int = Field(
             default=1048576,
             ge=1024,
-            description="Maximum image size in bytes before compression triggers.",
-        )
-        convert_png_to_jpeg: bool = Field(
-            default=True,
-            description="Convert PNG images to JPEG for better compression.",
-        )
-        preserve_transparency: bool = Field(
-            default=True,
-            description="Convert transparent PNGs to WebP instead of JPEG.",
+            description="Provider payload ceiling. Images larger than this are re-encoded/downscaled to fit.",
         )
         enable_vision_detection: bool = Field(
             default=True, description="Check if the model supports vision."
@@ -704,6 +783,9 @@ class Filter:
         self.valves = self.Valves()
         self.reconstructor = ContextReconstructor()
         self._locks: Dict[str, asyncio.Lock] = {}
+        # Failure backoff tracking for background summarization.
+        self._compress_failures: Dict[str, int] = {}
+        self._compress_cooldown_until: Dict[str, float] = {}
         self._image_stats = {
             "compressed": 0,
             "saved_bytes": 0,
@@ -903,6 +985,58 @@ class Filter:
                 compressible.append(msg)
         return MessagePools(protected_start, summarized, compressible, protected_end)
 
+    def _select_summary_batch(
+        self, msgs: List[Dict[str, Any]], budget: int
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Selects the batch of messages to summarize this round.
+
+        - Always includes at least the first message (so a single oversized
+          message can never stall the queue forever).
+        - Greedily fills up to `budget`.
+        - CRITICAL: never cuts in the middle of a group of messages sharing the
+          same timestamp. Otherwise the trailing tied messages would satisfy
+          `ts <= until_ts` and be classified as 'summarized' (stripped to
+          media-only) without ever actually being summarized -> silent gap.
+          If retracting the tie-tail would make zero progress, we instead
+          force-extend to swallow the whole tie group (accepting budget
+          overflow) to guarantee forward movement.
+        """
+        batch, cur_tok = [], 0
+        for m in msgs:
+            txt = f"{str(m.get('role', 'user')).upper()}: {m.get('content', '')}"
+            tok = TokenCounter.count(txt)
+            if batch and cur_tok + tok > budget:
+                break
+            batch.append(m)
+            cur_tok += tok
+
+        if len(batch) < len(msgs):
+            boundary_ts = self._timestamp_of(batch[-1])
+            next_ts = self._timestamp_of(msgs[len(batch)])
+            if boundary_ts is not None and boundary_ts == next_ts:
+                retracted = list(batch)
+                while retracted and self._timestamp_of(retracted[-1]) == boundary_ts:
+                    retracted.pop()
+                if retracted:
+                    # Safe: defer the tied tail to the next round.
+                    batch = retracted
+                else:
+                    # Whole batch shares boundary_ts with the following messages.
+                    # Force-extend to include the entire tie group.
+                    i = len(batch)
+                    while i < len(msgs) and self._timestamp_of(msgs[i]) == boundary_ts:
+                        batch.append(msgs[i])
+                        i += 1
+
+        cur_tok = sum(
+            TokenCounter.count(
+                f"{str(m.get('role', 'user')).upper()}: {m.get('content', '')}"
+            )
+            for m in batch
+        )
+        return batch, cur_tok
+
     def _message_has_passthrough_media(self, message: Dict[str, Any]) -> bool:
         content = message.get("content")
         media_types = {"image_url", "file", "input_image", "input_file"}
@@ -984,8 +1118,9 @@ class Filter:
     async def _process_pool_images(
         self,
         pool: List[Dict[str, Any]],
+        max_dim: int,
         quality: int,
-        compressor: Optional[ImageCompressor],
+        processor: Optional[ImageProcessor],
         supports_vision: bool,
     ) -> List[Dict[str, Any]]:
         if not self.valves.enable_image_compression or not pool:
@@ -1017,7 +1152,7 @@ class Filter:
                 processed_pool.append(msg_copy)
                 continue
 
-            if compressor and PILLOW_AVAILABLE and isinstance(content, list):
+            if processor and PILLOW_AVAILABLE and isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         img_url = part.get("image_url", {})
@@ -1028,35 +1163,30 @@ class Filter:
                         )
                         b64, fmt, _ = extract_base64_data(url)
 
-                        if (
-                            b64
-                            and calculate_base64_size(b64)
-                            > self.valves.max_image_size_bytes
-                        ):
+                        if b64 and calculate_base64_size(b64) > IMG_PROCESS_MIN_BYTES:
                             try:
 
-                                def _compress():
-                                    return compressor.compress_image(b64, fmt, quality)
+                                def _proc():
+                                    return processor.process(b64, fmt, max_dim, quality)
 
-                                new_b64, new_fmt, stats = await asyncio.to_thread(
-                                    _compress
-                                )
-                                new_url = f"data:{MIME_TYPES.get(new_fmt, 'image/jpeg')};base64,{new_b64}"
+                                new_b64, new_fmt, stats = await asyncio.to_thread(_proc)
+                                if stats.get("changed"):
+                                    new_url = f"data:{MIME_TYPES.get(new_fmt, 'image/jpeg')};base64,{new_b64}"
+                                    if isinstance(part["image_url"], dict):
+                                        part["image_url"]["url"] = new_url
+                                    else:
+                                        part["image_url"] = new_url
 
-                                if isinstance(part["image_url"], dict):
-                                    part["image_url"]["url"] = new_url
-                                else:
-                                    part["image_url"] = new_url
-
-                                self._image_stats["compressed"] += 1
-                                self._image_stats["saved_bytes"] += (
-                                    stats["original_size"] - stats["compressed_size"]
-                                )
-                                self._image_stats["original_bytes"] += stats[
-                                    "original_size"
-                                ]
+                                    self._image_stats["compressed"] += 1
+                                    self._image_stats["saved_bytes"] += (
+                                        stats["original_size"]
+                                        - stats["compressed_size"]
+                                    )
+                                    self._image_stats["original_bytes"] += stats[
+                                        "original_size"
+                                    ]
                             except Exception as e:
-                                logger.debug(f"Image compression failed: {e}")
+                                logger.debug(f"Image processing failed: {e}")
             processed_pool.append(msg_copy)
         return processed_pool
 
@@ -1141,12 +1271,8 @@ class Filter:
         )
 
         if self.valves.enable_image_compression:
-            compressor = (
-                ImageCompressor(
-                    self.valves.max_image_size_bytes,
-                    self.valves.convert_png_to_jpeg,
-                    self.valves.preserve_transparency,
-                )
+            processor = (
+                ImageProcessor(self.valves.max_image_size_bytes)
                 if PILLOW_AVAILABLE
                 else None
             )
@@ -1158,26 +1284,30 @@ class Filter:
 
             protected_start = await self._process_pool_images(
                 protected_start,
+                self.valves.image_max_dim_protected,
                 self.valves.image_quality_protected,
-                compressor,
+                processor,
                 supports_vision,
             )
             protected_end = await self._process_pool_images(
                 protected_end,
+                self.valves.image_max_dim_protected,
                 self.valves.image_quality_protected,
-                compressor,
+                processor,
                 supports_vision,
             )
             trimmed_compressible = await self._process_pool_images(
                 trimmed_compressible,
+                self.valves.image_max_dim_uncompressed,
                 self.valves.image_quality_uncompressed,
-                compressor,
+                processor,
                 supports_vision,
             )
             summarized_media = await self._process_pool_images(
                 summarized_media,
+                self.valves.image_max_dim_summarized,
                 self.valves.image_quality_summarized,
-                compressor,
+                processor,
                 supports_vision,
             )
 
@@ -1214,13 +1344,21 @@ class Filter:
             for m in pool
         )
 
+        # Shedding policy: drop content whose substance is ALREADY preserved
+        # before dropping un-archived live content.
+        #   1. summarized_media -> its TEXT is already in the archive; safe-ish.
+        #   2. uncompressed     -> NOT yet summarized; lives nowhere if dropped
+        #                          -> raise a loud warning.
+        #   3. protected_end    -> last resort, keep at least one.
         was_shed = False
+        shed_unsummarized = False
         while total_tok > max_tok and max_tok > 0:
             was_shed = True
-            if uncompressed:
-                total_tok -= TokenCounter.count(uncompressed.pop(0))
-            elif summarized_media:
+            if summarized_media:
                 total_tok -= TokenCounter.count(summarized_media.pop(0))
+            elif uncompressed:
+                shed_unsummarized = True
+                total_tok -= TokenCounter.count(uncompressed.pop(0))
             elif len(protected_end) > 1:
                 total_tok -= TokenCounter.count(protected_end.pop(0))
             else:
@@ -1249,7 +1387,13 @@ class Filter:
         stats = f"🪙 {format_tokens(p_tok + u_tok + s_tok + sm_tok)} │ 🛡️ {format_tokens(p_tok)} ({len(protected_start)+len(protected_end)}) · ⏳ {format_tokens(u_tok)} ({len(uncompressed)}) · 📦 {format_tokens(s_tok)} ({len(pools.summarized)}{eff_str})"
 
         if was_shed:
-            stats = f"⚠️ Limit Reached │ {stats}"
+            if shed_unsummarized:
+                stats = (
+                    f"⚠️ Context limit hit — dropped un-archived messages "
+                    f"(raise max_context_tokens) │ {stats}"
+                )
+            else:
+                stats = f"⚠️ Limit Reached │ {stats}"
         if self.valves.enable_image_compression and self._image_stats["count"] > 0:
             img_tok, img_cnt, orig_b, saved_b = (
                 self._image_stats["tokens"],
@@ -1343,11 +1487,24 @@ class Filter:
         )
 
         if trigger > self.valves.compression_threshold_tokens and comp_text:
-            await self._emit_status(
-                __event_emitter__, f"Summarizing {db_u_tok:,} new tokens...", False
-            )
+            now_ts = datetime.now(timezone.utc).timestamp()
+            cooldown_until = self._compress_cooldown_until.get(chat_id, 0)
             lock = self._lock_for(chat_id)
+
+            if now_ts < cooldown_until:
+                # In failure backoff: keep summarization paused but stay loud so
+                # the degraded state is never silent.
+                fails = self._compress_failures.get(chat_id, 0)
+                await self._emit_status(
+                    __event_emitter__,
+                    f"⚠️ Summarization paused after {fails} failure(s); will retry │ ☑️{view.stats_message}",
+                )
+                return body
+
             if not lock.locked():
+                await self._emit_status(
+                    __event_emitter__, f"Summarizing {db_u_tok:,} new tokens...", False
+                )
                 asyncio.create_task(
                     self._background_compress(
                         lock,
@@ -1381,32 +1538,21 @@ class Filter:
                     return
 
                 budget = max(10000, self.valves.max_context_tokens - 6000)
-                batch, cur_tok = [], 0
-                for m in msgs:
-                    txt = (
-                        f"{str(m.get('role', 'user')).upper()}: {m.get('content', '')}"
-                    )
-                    tok = TokenCounter.count(txt)
-                    if cur_tok + tok > budget:
-                        if not batch:
-                            batch = [m]
-                        break
-                    batch.append(m)
-                    cur_tok += tok
+                batch, cur_tok = self._select_summary_batch(msgs, budget)
 
                 pool_txt = "\n".join(
                     f"{str(m.get('role', 'user')).upper()}: {m.get('content', '')}"
                     for m in batch
                 ).strip()
 
-                prompt = f"""You are the "Context Architect". Update the conversation archive using the new events. Replace the old archive entirely.
+                prompt = f"""You are the "Context Architect". Update the conversation archive using the new events. Output the complete updated archive.
 ### STRUCTURE (Keep exact order. Include all headers even if empty)
 ## Current State
 Active facts, preferences, project constraints, and state. Include confidence %:
 - 90-100%: Verified/Implemented/Purchased
 - 70-89%: Strongly implied/Planned
 - 50-69%: Tentative/Discussed
-- <50%: Omit entirely
+- <50%: Retain but tag as (low-confidence). DO NOT delete low-confidence items.
 ## Decisions
 What was chosen and why (e.g., architecture, purchases, methodologies). Replace superseded decisions.
 ## Resolutions
@@ -1419,12 +1565,13 @@ If none, omit section.
 ## Open Items
 Pending actions, blockers, or unanswered questions. Remove when resolved.
 ### RULES
-1. PRECEDENCE: New events overwrite the old archive.
-2. NO HALLUCINATION: Only use provided text.
-3. CONCISE: Bullet points only. Strip filler.
-4. TERMINOLOGY: Preserve user's exact terms (e.g., specific brand names, technical jargon).
-5. OMIT: Small talk, greetings, AI meta-talk.
-6. FORMAT: Do not wrap the entire response in markdown fences. Start directly with "## Current State".
+1. PRESERVATION (CRITICAL): Reproduce EVERY entry from the CURRENT ARCHIVE verbatim unless it is explicitly superseded or resolved by a new event. Never drop, merge, or condense existing entries to save space. The archive is append-and-revise, not re-summarize.
+2. PRECEDENCE: When a new event contradicts the archive, the new event wins and replaces the old entry.
+3. NO HALLUCINATION: Only use provided text.
+4. CONCISE (for NEW content only): Bullet points. Strip filler from new events; do not strip existing entries.
+5. TERMINOLOGY: Preserve user's exact terms (e.g., specific brand names, technical jargon).
+6. OMIT: Small talk, greetings, AI meta-talk.
+7. FORMAT: Do not wrap the entire response in markdown fences. Start directly with "## Current State".
 ### CURRENT ARCHIVE:
 {old_summary or "No existing archive."}
 ### NEW EVENTS:
@@ -1463,6 +1610,9 @@ Provide ONLY the updated archive text. Start directly with "## Current State".""
                 )
 
                 if await _get_store().save(chat_id, new_sum, until_ts):
+                    # Success: clear any failure backoff state.
+                    self._compress_failures.pop(chat_id, None)
+                    self._compress_cooldown_until.pop(chat_id, None)
                     eff = (
                         max(
                             0.0,
@@ -1478,4 +1628,16 @@ Provide ONLY the updated archive text. Start directly with "## Current State".""
                         emitter, f"💾 Summary saved! {eff:.2f}% efficiency"
                     )
             except Exception as e:
-                await self._emit_status(emitter, f"⚠️ Summary failed: {str(e)[:80]}")
+                # Failure backoff: exponential with a 10-minute cap, so a broken
+                # summarizer doesn't hammer the model every turn — but the outlet
+                # surfaces a persistent warning so degradation is never silent.
+                fails = self._compress_failures.get(chat_id, 0) + 1
+                self._compress_failures[chat_id] = fails
+                backoff = min(600, 15 * (2 ** min(fails - 1, 6)))
+                self._compress_cooldown_until[chat_id] = (
+                    datetime.now(timezone.utc).timestamp() + backoff
+                )
+                await self._emit_status(
+                    emitter,
+                    f"⚠️ Summary failed (attempt {fails}); retry in {int(backoff)}s: {str(e)[:60]}",
+                )
